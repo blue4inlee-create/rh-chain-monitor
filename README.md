@@ -4,9 +4,9 @@ Robinhood Chain monitoring stack. GitHub is the single source of truth for code;
 
 ## Components
 
-- `apps-script/dex_refresh_v6_2_flow.gs` — stable 5-minute M5 + 15-minute amount-flow monitor used by the existing Google Sheet.
-- `apps-script/rh_newcoin_ingest_v2.gs` — webhook receiver for new-coin scanner. CA dedupe, First Seen preservation, raw-facts-only writes.
-- `scanner/` — Railway service for Robinhood Chain Discovery. It monitors current Pons V2 and Uniswap v4 by default; v3 is opt-in after address verification.
+- `apps-script/v6_2/*.gs` — stable `V6.2-flow-r3-flowlink`, split into maintainable Apps Script files. It runs 5-minute M5 monitoring, 15-minute DexPaprika amount flow, alerts, scorecard, cache and audit.
+- `apps-script/rh_newcoin_ingest_v2.gs` — webhook receiver for the new-coin scanner. It preserves First Seen, globally deduplicates CA and writes raw facts only.
+- `scanner/` — GitHub-source Railway service for Robinhood Chain Discovery. The clean rebuild currently enables Pons V2 and Uniswap v4/WETH discovery by default; v3 and wider quote-token coverage stay opt-in until their addresses are verified.
 - Google Sheet pipeline: `新币发现 -> Canary候选 -> 热度雷达 -> 执行深核`.
 
 ## Design rule
@@ -15,11 +15,15 @@ Discovery is allowed to be early and noisy. Canary is where safety gates begin. 
 
 ## Current production baseline
 
-The existing Sheet monitor is `V6.2-flow-r3-flowlink`. Do not mix older V4/V5 scripts back into the bound Apps Script project.
+The existing mature-token Sheet monitor is `V6.2-flow-r3-flowlink`. Do not mix older V4/V5 scripts back into the bound Apps Script project.
+
+The new-coin scanner is a clean GitHub rebuild. It intentionally starts with verified/defaultable listeners rather than pretending to have full legacy v1.5 coverage on day one.
 
 ## Railway
 
-Set the service root directory to `scanner` and deploy from this repository. Required variables for Sheet writes:
+The repository root contains a Railway-compatible `Dockerfile` and `railway.toml`; no source-code gzip/base64 environment-variable reconstruction is required.
+
+Required variables for Sheet writes:
 
 - `SHEET_WEBHOOK_URL`
 - `SHEET_INGEST_SECRET`
