@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/rh_newcoin_scanner.mjs",
-    "check": "node --check src/rh_newcoin_scanner.mjs"
+    "check": "node --check src/rh_newcoin_scanner.mjs && node --check src/smoke.mjs",
+    "smoke": "node src/smoke.mjs"
   },
   "dependencies": {
     "viem": "2.37.3"
