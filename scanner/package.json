@@ -1,0 +1,16 @@
+{
+  "name": "rh-newcoin-scanner",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/rh_newcoin_scanner.mjs",
+    "check": "node --check src/rh_newcoin_scanner.mjs"
+  },
+  "dependencies": {
+    "viem": "2.37.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
