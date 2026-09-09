@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  syntax:
+  syntax-and-runtime:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +21,9 @@ jobs:
       - name: Check scanner syntax
         working-directory: scanner
         run: npm run check
+      - name: Robinhood RPC smoke test
+        working-directory: scanner
+        run: npm run smoke
       - name: Check V6.2 Apps Script syntax
         run: |
           cat apps-script/v6_2/*.gs > /tmp/v6_2_all.js
@@ -29,3 +32,5 @@ jobs:
         run: |
           cp apps-script/rh_newcoin_ingest_v2.gs /tmp/ingest.js
           node --check /tmp/ingest.js
+      - name: Build Railway Docker image
+        run: docker build -t rh-chain-monitor:ci .
