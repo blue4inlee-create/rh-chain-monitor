@@ -6,11 +6,8 @@ on:
   pull_request:
 
 jobs:
-  scanner-syntax:
+  syntax:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: scanner
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -18,5 +15,17 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: scanner/package.json
-      - run: npm install --no-audit --no-fund
-      - run: npm run check
+      - name: Install scanner dependencies
+        working-directory: scanner
+        run: npm install --no-audit --no-fund
+      - name: Check scanner syntax
+        working-directory: scanner
+        run: npm run check
+      - name: Check V6.2 Apps Script syntax
+        run: |
+          cat apps-script/v6_2/*.gs > /tmp/v6_2_all.js
+          node --check /tmp/v6_2_all.js
+      - name: Check ingest Apps Script syntax
+        run: |
+          cp apps-script/rh_newcoin_ingest_v2.gs /tmp/ingest.js
+          node --check /tmp/ingest.js
