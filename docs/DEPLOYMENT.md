@@ -2,7 +2,7 @@
 
 ## 1. Apps Script stable monitor
 
-The bound Google Sheet project should contain the latest `apps-script/dex_refresh_v6_2_flow.gs` and run `installDexRefresh()` once.
+The bound Google Sheet project should contain all files under `apps-script/v6_2/`. Together they are the stable `V6.2-flow-r3-flowlink` currently used by the workbook. Run `installDexRefresh()` once after replacing an older project.
 
 ## 2. Apps Script scanner receiver
 
@@ -14,9 +14,11 @@ Add `apps-script/rh_newcoin_ingest_v2.gs` to an Apps Script project attached to 
 4. Set Railway `SHEET_WEBHOOK_URL` to the `/exec` URL.
 5. Set Railway `SHEET_INGEST_SECRET` to the same secret.
 
+The receiver writes only raw discovery facts into `新币发现`; Sheet formulas perform Discovery/Canary scoring.
+
 ## 3. Railway scanner
 
-Deploy this GitHub repository with service root directory `scanner`.
+Deploy this GitHub repository directly from `main`. The root `Dockerfile` and `railway.toml` are sufficient; do not use the legacy source-fragment start command.
 
 Recommended variables:
 
@@ -28,7 +30,9 @@ HEARTBEAT_MS=30000
 DRY_RUN=false
 ```
 
-The current Pons V2 factory, Uniswap v4 PoolManager and WETH defaults are in code and can be overridden by environment variables. V3 is disabled until `UNIV3_FACTORY` is explicitly supplied.
+The current Pons V2 factory, Uniswap v4 PoolManager and WETH defaults are in code and can be overridden by environment variables. V3 is disabled until `UNIV3_FACTORY` is explicitly supplied. Additional USDG/stock quote tokens can be supplied through `QUOTE_TOKENS` after verification.
+
+For first boot, `DRY_RUN=true` is safe: the service scans and exposes health without writing to Sheet. After the Apps Script Web App is configured, set the webhook variables and switch to `DRY_RUN=false`.
 
 ## 4. Health
 
