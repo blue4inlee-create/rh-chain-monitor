@@ -1,10 +1,10 @@
 {
   "name": "rh-newcoin-scanner",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/rh_newcoin_scanner.mjs",
+    "start": "sh -c 'node src/enricher.mjs & exec node src/rh_newcoin_scanner.mjs'",
     "check": "node --check src/rh_newcoin_scanner.mjs && node --check src/enricher.mjs && node --check src/smoke.mjs",
     "smoke": "node src/smoke.mjs"
   },
