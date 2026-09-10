@@ -26,12 +26,13 @@ function isDiscoveryPayload(payload) {
   return stage.includes('launched') || stage.includes('pool') || stage.includes('initialized') || stage.includes('discovery');
 }
 
-async function forward(upstreamUrl, payload) {
+async function forward(upstreamUrl, upstreamSecret, payload) {
   if (!upstreamUrl) return { ok: true, skipped: 'upstream_not_configured' };
+  const outbound = upstreamSecret ? { ...payload, secret: upstreamSecret } : payload;
   const res = await fetch(upstreamUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(outbound),
     signal: AbortSignal.timeout(20_000),
   });
   const text = await res.text();
@@ -46,7 +47,8 @@ async function forward(upstreamUrl, payload) {
 export async function startPersistenceProxy({
   port = Number(process.env.PERSIST_PROXY_PORT || 3101),
   upstreamUrl = String(process.env.SHEET_WEBHOOK_URL || '').trim(),
-  secret = String(process.env.SHEET_INGEST_SECRET || '').trim(),
+  localSecret = 'sqlite-local-ingest',
+  upstreamSecret = String(process.env.SHEET_INGEST_SECRET || '').trim(),
 } = {}) {
   const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/health') {
@@ -66,7 +68,7 @@ export async function startPersistenceProxy({
 
     try {
       const payload = await readJson(req);
-      if (secret && String(payload.secret || '') !== secret) {
+      if (String(payload.secret || '') !== localSecret) {
         res.writeHead(403, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: 'bad_secret' }));
       }
@@ -83,7 +85,7 @@ export async function startPersistenceProxy({
         }));
       }
 
-      const upstream = await forward(upstreamUrl, payload);
+      const upstream = await forward(upstreamUrl, upstreamSecret, payload);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true, db: dbResult, upstream }));
     } catch (err) {
