@@ -1,4 +1,17 @@
+import { createPublicClient, http as viemHttp } from 'viem';
 import { getDatabase } from './db.mjs';
+
+const RPC_URL = process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com';
+const chainClient = createPublicClient({
+  chain: {
+    id: 4663,
+    name: 'Robinhood Chain',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: { default: { http: [RPC_URL] } },
+  },
+  transport: viemHttp(RPC_URL, { timeout: 12000, retryCount: 1 }),
+});
+const blockTimeCache = new Map();
 
 function txt(v) {
   return v == null ? '' : String(v).trim();
@@ -20,6 +33,32 @@ function secondsBetween(a, b) {
   const y = Date.parse(b || '');
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
   return (y - x) / 1000;
+}
+
+async function chainTimeForBlock(blockNumber) {
+  const n = Number(blockNumber || 0);
+  if (!Number.isInteger(n) || n <= 0) return '';
+  if (blockTimeCache.has(n)) return blockTimeCache.get(n);
+  try {
+    const block = await chainClient.getBlock({ blockNumber: BigInt(n) });
+    const value = new Date(Number(block.timestamp) * 1000).toISOString();
+    blockTimeCache.set(n, value);
+    if (blockTimeCache.size > 500) blockTimeCache.delete(blockTimeCache.keys().next().value);
+    return value;
+  } catch (err) {
+    console.warn('[lifecycle block-time]', JSON.stringify({ block:n, error:String(err?.message || err) }));
+    return '';
+  }
+}
+
+export async function normalizeLifecyclePayloadTime(payload = {}) {
+  if (iso(payload.chainTime)) return payload;
+  const stage = txt(payload.stage).toLowerCase();
+  const needsExactBlockTime = stage.includes('poolgraduated') || (stage.includes('v4') && stage.includes('initialized'));
+  if (!needsExactBlockTime) return payload;
+  const block = Number(payload.block || payload.block_number || 0);
+  const chainTime = await chainTimeForBlock(block);
+  return chainTime ? { ...payload, chainTime } : payload;
 }
 
 export function ensureLifecycleMilestoneSchema() {
