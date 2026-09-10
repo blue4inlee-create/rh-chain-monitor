@@ -1,7 +1,7 @@
 import { getDatabase } from './db.mjs';
-import { ensureScoreV2Schema, backfillM30ScoresV2, SCORE_V2_VERSION } from './scoring_v2.mjs';
 
 export const SHADOW_LADDER_VERSION = 'stage-ladder-v1.0-shadow';
+export const SHADOW_SCORE_VERSION = 'score-v2.0-shadow';
 
 const RANK = {
   NONE: 0,
@@ -22,7 +22,6 @@ function safeJson(v) {
 }
 
 export function ensureShadowLadderSchema() {
-  ensureScoreV2Schema();
   const db = getDatabase();
   db.exec(`
     CREATE TABLE IF NOT EXISTS stage_ladder_shadow (
@@ -115,8 +114,13 @@ function candidateFor(row, nowMs) {
 
 export function refreshShadowStages({ limit = 1000 } = {}) {
   ensureShadowLadderSchema();
-  backfillM30ScoresV2({ limit: Math.max(100, Number(limit) || 1000) });
   const db = getDatabase();
+  const scoreTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='scores_v2_shadow'").get();
+  const m30Table = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='marlin_30s'").get();
+  if (!scoreTable || !m30Table) {
+    return { evaluated: 0, advanced: 0, stageCounts: {}, version: SHADOW_LADDER_VERSION, evaluatedAt: new Date().toISOString() };
+  }
+
   const now = new Date();
   const nowIso = now.toISOString();
   const nowMs = now.getTime();
@@ -144,9 +148,9 @@ export function refreshShadowStages({ limit = 1000 } = {}) {
     WHERE v.score_version=?
     ORDER BY v.scored_at DESC
     LIMIT ?
-  `).all(SCORE_V2_VERSION, Math.max(100, Number(limit) || 1000));
+  `).all(SHADOW_SCORE_VERSION, Math.max(100, Number(limit) || 1000));
 
-  const getExisting = db.prepare('SELECT shadow_stage, stage_rank, first_qualified_at FROM stage_ladder_shadow WHERE token_address=?');
+  const getExisting = db.prepare('SELECT shadow_stage, stage_rank, first_qualified_at, stage_updated_at FROM stage_ladder_shadow WHERE token_address=?');
   const upsert = db.prepare(`
     INSERT INTO stage_ladder_shadow (
       token_address, shadow_stage, stage_rank, score_v2, m30_age_sec,
@@ -187,13 +191,14 @@ export function refreshShadowStages({ limit = 1000 } = {}) {
   const tx = db.transaction(() => {
     for (const row of rows) {
       const c = candidateFor(row, nowMs);
-      const old = getExisting.get(row.token_address) || { shadow_stage: 'NONE', stage_rank: 0, first_qualified_at: null };
+      const old = getExisting.get(row.token_address) || {
+        shadow_stage: 'NONE', stage_rank: 0, first_qualified_at: null, stage_updated_at: null,
+      };
       const oldRank = Number(old.stage_rank || 0);
       const finalRank = Math.max(oldRank, c.rank);
       const finalStage = Object.entries(RANK).find(([, rank]) => rank === finalRank)?.[0] || 'NONE';
-      const qualifiesNow = c.rank > 0;
-      const firstQualifiedAt = old.first_qualified_at || (qualifiesNow ? nowIso : null);
-      const stageUpdatedAt = c.rank > oldRank ? nowIso : null;
+      const firstQualifiedAt = old.first_qualified_at || (c.rank > 0 ? nowIso : null);
+      const stageUpdatedAt = c.rank > oldRank ? nowIso : old.stage_updated_at || null;
       const reason = {
         candidateStage: c.stage,
         retainedStage: finalStage,
@@ -217,7 +222,7 @@ export function refreshShadowStages({ limit = 1000 } = {}) {
         row.token_address, finalStage, finalRank, c.score, c.m30Age,
         c.discoveryMax, c.currentMultiple, c.tokenAgeMin, c.productionStage,
         c.hardFail ? 1 : 0, safeJson(reason), SHADOW_LADDER_VERSION,
-        firstQualifiedAt, stageUpdatedAt || old.stage_updated_at || null, nowIso,
+        firstQualifiedAt, stageUpdatedAt, nowIso,
       );
 
       if (c.rank > oldRank) {
