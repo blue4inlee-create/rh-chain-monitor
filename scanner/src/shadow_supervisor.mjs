@@ -4,10 +4,10 @@ let stopping = false;
 let runner = null;
 let shadow = null;
 
-function start(file, label) {
+function start(file, label, extraEnv = {}) {
   const child = spawn(process.execPath, [new URL(file, import.meta.url).pathname], {
     stdio: 'inherit',
-    env: process.env,
+    env: { ...process.env, ...extraEnv },
   });
   child.on('error', err => console.error(`[shadow-supervisor ${label}]`, err));
   return child;
@@ -15,7 +15,9 @@ function start(file, label) {
 
 function startShadow() {
   if (stopping) return;
-  shadow = start('./fast_m30_shadow.mjs', 'fast-m30');
+  shadow = start('./fast_m30_shadow.mjs', 'fast-m30', {
+    RH_HTTP_URL: process.env.FAST_M30_RPC_URL || process.env.RH_HTTP_URL,
+  });
   shadow.on('exit', (code, signal) => {
     if (stopping) return;
     console.error(`[shadow-supervisor fast-m30] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
