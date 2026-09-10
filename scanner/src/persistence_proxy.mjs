@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { persistDiscoveryEvent, getDatabaseHealth } from './db.mjs';
-import { persistLifecycleMilestone, getLifecycleMilestoneHealth } from './lifecycle_milestones.mjs';
+import { persistLifecycleMilestone, getLifecycleMilestoneHealth, normalizeLifecyclePayloadTime } from './lifecycle_milestones.mjs';
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -79,9 +79,10 @@ export async function startPersistenceProxy({
         return res.end(JSON.stringify({ ok: false, error: 'bad_secret' }));
       }
 
+      const lifecyclePayload = await normalizeLifecyclePayloadTime(payload);
       let lifecycleResult = { ok: true, skipped: true };
-      if (payload?.tokenCa || payload?.token_address) {
-        lifecycleResult = persistLifecycleMilestone(payload);
+      if (lifecyclePayload?.tokenCa || lifecyclePayload?.token_address) {
+        lifecycleResult = persistLifecycleMilestone(lifecyclePayload);
         if (!lifecycleResult?.ok && !lifecycleResult?.skipped) throw new Error('lifecycle_persist_failed');
       }
 
