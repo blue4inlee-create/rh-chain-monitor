@@ -6,8 +6,9 @@ import { ensureScoreSchema } from './scoring.mjs';
 import { ensureScoreV2Schema, backfillM30ScoresV2, getScoreV2Health } from './scoring_v2.mjs';
 import { ensureRiskSchema } from './risk.mjs';
 import { ensureStageSchema, getStageHealth } from './stages.mjs';
+import { ensureLifecycleMilestoneSchema, getLifecycleMilestoneHealth } from './lifecycle_milestones.mjs';
 
-export const RESULT_VERSION = '2.17.0';
+export const RESULT_VERSION = '2.18.0';
 
 function text(v) { return v == null ? '' : String(v).trim(); }
 function num(v) {
@@ -186,7 +187,26 @@ function stageRows(db, lookup, limit) {
   });
 }
 
-export function buildSheetPayload({ discoveryLimit=500, stageLimit=500 }={}) {
+function lifecycleRows(db, limit) {
+  ensureLifecycleMilestoneSchema();
+  return db.prepare(`
+    SELECT l.*, t.symbol
+    FROM lifecycle_milestones l
+    LEFT JOIN tokens t ON t.token_address=l.token_address
+    ORDER BY l.updated_at DESC, l.token_address ASC
+    LIMIT ?
+  `).all(limit).map(r => [
+    safe(r.updated_at), safe(r.symbol), r.token_address,
+    safe(r.launch_at), safe(r.launch_block), safe(r.launch_tx), safe(r.curve_address),
+    safe(r.first_swap_at), safe(r.first_swap_block), safe(r.first_swap_tx), safe(r.first_swap_direction),
+    safe(r.launch_to_first_swap_sec),
+    safe(r.graduated_at), safe(r.graduated_block), safe(r.graduated_tx), safe(r.launch_to_graduated_sec),
+    safe(r.v4_pool_at), safe(r.v4_pool_block), safe(r.v4_pool_tx), safe(r.v4_pool_key),
+    safe(r.graduated_to_v4_sec), safe(r.launch_to_v4_sec),
+  ]);
+}
+
+export function buildSheetPayload({ discoveryLimit=500, stageLimit=500, lifecycleLimit=900 }={}) {
   initializeDatabase();
   initializeDeadLetterStore();
   ensurePriceMilestoneSchema();
@@ -196,6 +216,7 @@ export function buildSheetPayload({ discoveryLimit=500, stageLimit=500 }={}) {
   const v2Backfill = backfillM30ScoresV2(500);
   ensureRiskSchema();
   ensureStageSchema();
+  ensureLifecycleMilestoneSchema();
   const db = getDatabase();
   const lookup = prepareLookups(db);
   const dead = getDeadLetterStats();
@@ -203,6 +224,7 @@ export function buildSheetPayload({ discoveryLimit=500, stageLimit=500 }={}) {
   const ath = getAthHealth();
   const stages = getStageHealth();
   const v2 = getScoreV2Health();
+  const lifecycle = getLifecycleMilestoneHealth();
   return {
     kind: 'result_sync_v1',
     generatedAt: new Date().toISOString(),
@@ -211,6 +233,7 @@ export function buildSheetPayload({ discoveryLimit=500, stageLimit=500 }={}) {
       '新币发现': discoveryRows(db, lookup, Math.max(50, Math.min(900, Number(discoveryLimit) || 500))),
       'Canary跟踪': canaryRows(db, lookup),
       '阶段升级记录': stageRows(db, lookup, Math.max(50, Math.min(900, Number(stageLimit) || 500))),
+      '生命周期': lifecycleRows(db, Math.max(50, Math.min(2000, Number(lifecycleLimit) || 900))),
     },
     health: {
       ...dbHealth,
@@ -219,6 +242,7 @@ export function buildSheetPayload({ discoveryLimit=500, stageLimit=500 }={}) {
       marketTicks: ath.marketTicks,
       canaries: ath.canaries,
       stages: stages.stages,
+      lifecycle,
       scoreV2: v2,
       scoreV2Backfill: v2Backfill,
     },
