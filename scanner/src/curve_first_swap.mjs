@@ -36,6 +36,8 @@ export function ensureCurveFirstSwapSchema() {
 export function loadPendingCurveRegistry(limit = 5000) {
   ensureCurveFirstSwapSchema();
   const db = getDatabase();
+  const recoveryMinutes = Math.max(5, Number(process.env.CURVE_RECOVERY_MINUTES || 30));
+  const cutoff = new Date(Date.now() - recoveryMinutes * 60_000).toISOString();
   const rows = db.prepare(`
     SELECT p.pool_address AS curve_address, p.pool_key, p.token_address,
            p.discovered_at AS launch_at, p.block_number AS launch_block,
@@ -45,9 +47,10 @@ export function loadPendingCurveRegistry(limit = 5000) {
     WHERE p.pool_version='Curve'
       AND COALESCE(t.first_swap_tx, '')=''
       AND p.pool_address <> ''
+      AND p.discovered_at >= ?
     ORDER BY p.discovered_at DESC
     LIMIT ?
-  `).all(Math.max(1, Number(limit) || 5000));
+  `).all(cutoff, Math.max(1, Number(limit) || 5000));
   return rows.filter(r => validAddress(r.curve_address) && validAddress(r.token_address));
 }
 
@@ -104,5 +107,9 @@ export function getCurveFirstSwapHealth() {
   const db = getDatabase();
   const captured = Number(db.prepare('SELECT COUNT(*) AS n FROM curve_first_swaps').get()?.n || 0);
   const latest = db.prepare(`SELECT token_address, curve_address, direction, tx_hash, block_number, chain_time, detected_at, launch_at, launch_to_swap_sec FROM curve_first_swaps ORDER BY detected_at DESC LIMIT 1`).get() || null;
-  return { captured, latest };
+  return {
+    captured,
+    recoveryMinutes: Math.max(5, Number(process.env.CURVE_RECOVERY_MINUTES || 30)),
+    latest,
+  };
 }
