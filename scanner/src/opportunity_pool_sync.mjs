@@ -2,6 +2,7 @@
 // Aggregates existing scanner outputs into trading candidates.
 
 import { normalizeOpportunity, buildOpportunityPool } from './opportunity_pool.mjs';
+import { saveOpportunityRows } from './opportunity_repository.mjs';
 
 export function buildOpportunityCandidates({ tokens = [], snapshots = [], fastM30 = [], canary = [] } = {}) {
   const snapshotMap = new Map(snapshots.map(x => [x.token_address || x.address, x]));
@@ -28,5 +29,7 @@ export function buildOpportunityCandidates({ tokens = [], snapshots = [], fastM3
     });
   });
 
-  return buildOpportunityPool(rows);
+  const pool = buildOpportunityPool(rows);
+  saveOpportunityRows(pool);
+  return pool;
 }
