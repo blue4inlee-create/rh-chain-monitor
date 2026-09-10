@@ -3,10 +3,11 @@ import { initializeDeadLetterStore, getDeadLetterStats } from './dead_letter.mjs
 import { ensurePriceMilestoneSchema } from './price_milestones.mjs';
 import { ensureAthSchema, getAthHealth } from './ath_metrics.mjs';
 import { ensureScoreSchema } from './scoring.mjs';
+import { ensureScoreV2Schema, backfillM30ScoresV2, getScoreV2Health } from './scoring_v2.mjs';
 import { ensureRiskSchema } from './risk.mjs';
 import { ensureStageSchema, getStageHealth } from './stages.mjs';
 
-export const RESULT_VERSION = '2.16.0';
+export const RESULT_VERSION = '2.17.0';
 
 function text(v) { return v == null ? '' : String(v).trim(); }
 function num(v) {
@@ -60,7 +61,8 @@ function prepareLookups(db) {
     pool: db.prepare(`SELECT * FROM pools WHERE token_address=? ORDER BY discovered_at ASC, id ASC LIMIT 1`),
     latestSnapshot: db.prepare(`SELECT * FROM snapshots WHERE token_address=? ORDER BY snapshot_at DESC, id DESC LIMIT 1`),
     initialSnapshot: db.prepare(`SELECT * FROM snapshots WHERE token_address=? ORDER BY snapshot_at ASC, id ASC LIMIT 1`),
-    latestScore: db.prepare(`SELECT * FROM scores WHERE token_address=? ORDER BY scored_at DESC, id DESC LIMIT 1`),
+    latestScore: db.prepare(`SELECT * FROM scores WHERE token_address=? AND score_version='score-v1.0' ORDER BY scored_at DESC, id DESC LIMIT 1`),
+    v2Score: db.prepare(`SELECT * FROM scores_v2_shadow WHERE token_address=? ORDER BY scored_at DESC, id DESC LIMIT 1`),
     stageEntry: db.prepare(`SELECT * FROM stage_history WHERE token_address=? AND to_stage='CANARY' ORDER BY changed_at ASC, id ASC LIMIT 1`),
     latestTick: db.prepare(`SELECT * FROM market_ticks WHERE token_address=? ORDER BY tick_at DESC, id DESC LIMIT 1`),
     canaryTicks: db.prepare(`SELECT tick_at, price_usd FROM market_ticks WHERE token_address=? AND tick_at>=? AND price_usd IS NOT NULL ORDER BY tick_at ASC, id ASC`),
@@ -95,6 +97,7 @@ function discoveryRows(db, lookup, limit) {
     const latest = lookup.latestSnapshot.get(t.token_address) || {};
     const initial = lookup.initialSnapshot.get(t.token_address) || {};
     const score = lookup.latestScore.get(t.token_address) || {};
+    const v2 = lookup.v2Score.get(t.token_address) || {};
     const m30 = lookup.marlin30 ? (lookup.marlin30.get(t.token_address) || {}) : {};
     const risks = summarizeRisk(lookup.riskRows.all(t.token_address, text(latest.snapshot_type)));
     const ageSec = Math.max(0, Math.round((now - new Date(t.first_seen_at).getTime()) / 1000));
@@ -114,6 +117,7 @@ function discoveryRows(db, lookup, limit) {
       num(m30.reserve_usd) != null ? `M30Reserve=$${Number(m30.reserve_usd).toFixed(0)}` : '',
       num(m30.curve_progress_pct) != null ? `M30Progress=${Number(m30.curve_progress_pct).toFixed(1)}%` : '',
       num(m30.score_at_observation) != null ? `M30Score=${Number(m30.score_at_observation).toFixed(1)}` : '',
+      num(v2.final_score) != null ? `V2Shadow=${Number(v2.final_score).toFixed(1)}` : '',
       Number(m30.graduated || 0) === 1 ? 'M30Graduated=1' : '',
     ].filter(Boolean).join(' | ');
     return [
@@ -188,6 +192,8 @@ export function buildSheetPayload({ discoveryLimit=500, stageLimit=500 }={}) {
   ensurePriceMilestoneSchema();
   ensureAthSchema();
   ensureScoreSchema();
+  ensureScoreV2Schema();
+  const v2Backfill = backfillM30ScoresV2(500);
   ensureRiskSchema();
   ensureStageSchema();
   const db = getDatabase();
@@ -196,6 +202,7 @@ export function buildSheetPayload({ discoveryLimit=500, stageLimit=500 }={}) {
   const dbHealth = getDatabaseHealth();
   const ath = getAthHealth();
   const stages = getStageHealth();
+  const v2 = getScoreV2Health();
   return {
     kind: 'result_sync_v1',
     generatedAt: new Date().toISOString(),
@@ -212,6 +219,8 @@ export function buildSheetPayload({ discoveryLimit=500, stageLimit=500 }={}) {
       marketTicks: ath.marketTicks,
       canaries: ath.canaries,
       stages: stages.stages,
+      scoreV2: v2,
+      scoreV2Backfill: v2Backfill,
     },
   };
 }
