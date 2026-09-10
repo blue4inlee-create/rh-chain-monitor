@@ -1,3 +1,4 @@
+import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { rm, readFile, writeFile } from 'node:fs/promises';
 import { initializeDatabase, closeDatabase } from './db.mjs';
@@ -5,13 +6,15 @@ import { initializeDeadLetterStore, getDeadLetterStats } from './dead_letter.mjs
 import { ensurePriceMilestoneSchema, getPriceMilestoneHealth } from './price_milestones.mjs';
 import { ensureAthSchema, getAthHealth } from './ath_metrics.mjs';
 import { startPersistenceProxy } from './persistence_proxy.mjs';
-import { ensureOpsSchema, recordOpsEvent, writeRuntimeStatus } from './ops_status.mjs';
+import { ensureOpsSchema, recordOpsEvent, writeRuntimeStatus, STATUS_PATH } from './ops_status.mjs';
 
 const VERSION = '2.13.0';
 const ROOT = new URL('.', import.meta.url);
 const QUEUE_PATH = process.env.ENRICH_QUEUE_PATH || '/tmp/rh_enrich_queue.jsonl';
 const OFFSET_PATH = process.env.ENRICH_OFFSET_PATH || '/tmp/rh_enrich_queue.offset';
 const VOLUME_PROBE_PATH = process.env.VOLUME_PROBE_PATH || '/data/volume_probe.json';
+const HEALTH_PORT = Number(process.env.PORT || 8080);
+const SCANNER_INTERNAL_PORT = Number(process.env.SCANNER_INTERNAL_PORT || 3102);
 const PERSIST_PROXY_PORT = Number(process.env.PERSIST_PROXY_PORT || 3101);
 const UPSTREAM_SHEET_WEBHOOK_URL = String(process.env.SHEET_WEBHOOK_URL || '').trim();
 const RESULT_SHEET_WEBHOOK_URL = String(process.env.RESULT_SHEET_WEBHOOK_URL || '').trim();
@@ -19,11 +22,13 @@ const UPSTREAM_SHEET_SECRET = String(process.env.SHEET_INGEST_SECRET || '').trim
 const LOCAL_PERSIST_SECRET = 'sqlite-local-ingest';
 const LEGACY_ENRICHER = /^(1|true|yes)$/i.test(String(process.env.LEGACY_ENRICHER_ENABLED || 'false'));
 let stopping = false;
+let scanner = null;
 let enricher = null;
 let jobWorker = null;
 let marketTracker = null;
 let sheetSync = null;
 let persistenceProxy = null;
+let healthServer = null;
 let runtimeTimer = null;
 
 function spawnNode(file, label, extraEnv = {}) {
@@ -103,10 +108,13 @@ function startSheetSync() {
   });
 }
 
+function alive(child) {
+  return Boolean(child && child.exitCode == null && !child.killed);
+}
+
 function workerStatus() {
-  const alive = child => Boolean(child && child.exitCode == null && !child.killed);
   return {
-    scanner: true,
+    scanner: alive(scanner),
     jobWorker: alive(jobWorker),
     canaryMarketTracker: alive(marketTracker),
     legacyEnricher: LEGACY_ENRICHER ? alive(enricher) : false,
@@ -136,6 +144,55 @@ async function refreshRuntimeStatus() {
   } catch (err) {
     console.error('[runtime status]', err?.message || err);
   }
+}
+
+async function scannerCoreHealth() {
+  try {
+    const res = await fetch(`http://127.0.0.1:${SCANNER_INTERNAL_PORT}/health`, {
+      signal: AbortSignal.timeout(1200),
+    });
+    if (!res.ok) return { ok:false, status:res.status };
+    return await res.json();
+  } catch (err) {
+    return { ok:false, error:String(err?.message || err) };
+  }
+}
+
+async function compositeHealth() {
+  let runtime = null;
+  try { runtime = JSON.parse(await readFile(STATUS_PATH, 'utf8')); } catch {}
+  const core = await scannerCoreHealth();
+  const ageMs = runtime?.generatedAt ? Date.now() - new Date(runtime.generatedAt).getTime() : Infinity;
+  const workers = runtime?.workers || workerStatus();
+  const healthy = Boolean(
+    core?.ok && ageMs < 60000 && workers.scanner && workers.jobWorker && workers.canaryMarketTracker
+  );
+  return {
+    ok: healthy,
+    service: 'scanner-monitor',
+    version: VERSION,
+    checkedAt: new Date().toISOString(),
+    runtimeAgeSec: Number.isFinite(ageMs) ? Math.max(0, Math.round(ageMs / 1000)) : null,
+    scannerCore: core,
+    ...runtime,
+    ok: healthy,
+  };
+}
+
+function startHealthServer() {
+  healthServer = http.createServer(async (req, res) => {
+    if (req.url === '/health') {
+      const body = await compositeHealth();
+      res.writeHead(body.ok ? 200 : 503, { 'content-type':'application/json' });
+      res.end(JSON.stringify(body));
+      return;
+    }
+    res.writeHead(404, { 'content-type':'application/json' });
+    res.end(JSON.stringify({ ok:false, error:'not_found' }));
+  });
+  healthServer.listen(HEALTH_PORT, '0.0.0.0', () => {
+    console.log(`[runner health] listening on :${HEALTH_PORT}`);
+  });
 }
 
 async function probeVolume() {
@@ -206,18 +263,22 @@ async function main() {
     resultSheetSyncConfigured: Boolean(RESULT_SHEET_WEBHOOK_URL && UPSTREAM_SHEET_SECRET),
   }));
 
+  startHealthServer();
   startEnricher();
   startJobWorker();
   startMarketTracker();
   startSheetSync();
-  await refreshRuntimeStatus();
-  runtimeTimer = setInterval(refreshRuntimeStatus, 15000);
-  runtimeTimer.unref();
 
-  const scanner = spawnNode('rh_newcoin_scanner.mjs', 'scanner', {
+  scanner = spawnNode('rh_newcoin_scanner.mjs', 'scanner', {
+    PORT: String(SCANNER_INTERNAL_PORT),
     SHEET_WEBHOOK_URL: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
     SHEET_INGEST_SECRET: LOCAL_PERSIST_SECRET,
   });
+
+  await new Promise(resolve => setTimeout(resolve, 250));
+  await refreshRuntimeStatus();
+  runtimeTimer = setInterval(refreshRuntimeStatus, 15000);
+  runtimeTimer.unref();
 
   scanner.on('exit', (code, signal) => {
     if (stopping) {
@@ -233,6 +294,7 @@ async function main() {
     if (marketTracker && !marketTracker.killed) marketTracker.kill('SIGTERM');
     if (sheetSync && !sheetSync.killed) sheetSync.kill('SIGTERM');
     if (persistenceProxy) persistenceProxy.close();
+    if (healthServer) healthServer.close();
     closeDatabase();
     process.exitCode = code && code > 0 ? code : 1;
   });
@@ -249,6 +311,7 @@ async function main() {
     if (marketTracker && !marketTracker.killed) marketTracker.kill(signal);
     if (sheetSync && !sheetSync.killed) sheetSync.kill(signal);
     if (persistenceProxy) persistenceProxy.close();
+    if (healthServer) healthServer.close();
     closeDatabase();
     setTimeout(() => process.exit(0), 1500).unref();
   }
