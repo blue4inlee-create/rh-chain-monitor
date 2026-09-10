@@ -10,7 +10,7 @@ import { ensurePriceMilestoneSchema } from './price_milestones.mjs';
 import { ensureAthSchema, recordMarketTick, getAthHealth } from './ath_metrics.mjs';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
-const VERSION = '2.15.0-shadow';
+const VERSION = '2.16.0-marlin30';
 const CFG = {
   chainId: 4663,
   rpc: process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com',
@@ -27,6 +27,12 @@ const CFG = {
   shadowMaxAgeMs: Math.max(5 * 60_000, Number(process.env.SHADOW_TRACK_MAX_AGE_MS || 30 * 60_000)),
   shadowIntervalMs: Math.max(60_000, Number(process.env.SHADOW_TRACK_INTERVAL_MS || 300_000)),
   shadowBatchSize: Math.max(1, Math.min(10, Number(process.env.SHADOW_TRACK_BATCH || 2))),
+  marlinEnabled: !/^(0|false|no)$/i.test(String(process.env.MARLIN_30S_ENABLED || 'true')),
+  marlinMinScore: Math.max(0, Number(process.env.MARLIN_30S_MIN_SCORE || 48)),
+  marlinMinAgeMs: Math.max(15_000, Number(process.env.MARLIN_30S_MIN_AGE_MS || 22_000)),
+  marlinMaxAgeMs: Math.max(45_000, Number(process.env.MARLIN_30S_MAX_AGE_MS || 90_000)),
+  marlinPollMs: Math.max(3_000, Number(process.env.MARLIN_30S_POLL_MS || 5_000)),
+  marlinBatchSize: Math.max(1, Math.min(4, Number(process.env.MARLIN_30S_BATCH || 1))),
 };
 
 const client = createPublicClient({
@@ -44,7 +50,10 @@ const factoryAbi = parseAbi([
   'struct LaunchedToken { address token; address curve; address deployer; address creatorFeeRecipient; address pairToken; uint256 graduationThreshold; uint24 poolFee; int24 tickSpacing; uint16 creatorTaxBps; bool buybackEnabled; uint8 phase; uint256 sweptQuote; uint256 sweptTokens; uint256 sweptAt; bool exists; }',
   'function getLaunchedToken(address token) view returns (LaunchedToken)',
 ]);
-const curveAbi = parseAbi(['function getReserves() view returns (uint256 quoteReserve, uint256 tokenReserve)']);
+const curveAbi = parseAbi([
+  'function getReserves() view returns (uint256 quoteReserve, uint256 tokenReserve)',
+  'function realQuoteReserve() view returns (uint256)',
+]);
 
 const quoteDecimalsCache = new Map();
 const quotePriceCache = new Map();
@@ -62,6 +71,19 @@ function num(v) {
 function validAddress(v) { return /^0x[a-fA-F0-9]{40}$/.test(text(v)); }
 function nativeQuote(v) { return !v || text(v).toLowerCase() === ZERO; }
 function rateLimited(err) { return /429|rate.?limit|too many requests|-32005/i.test(text(err?.message || err)); }
+function pctChange(current, initial) {
+  const a = num(current), b = num(initial);
+  if (a == null || b == null || b === 0) return null;
+  return ((a - b) / b) * 100;
+}
+function safeJson(v) {
+  try { return JSON.stringify(v, (_, x) => typeof x === 'bigint' ? x.toString() : x); }
+  catch { return '{}'; }
+}
+function parseJson(v) {
+  try { return JSON.parse(String(v || '{}')); }
+  catch { return {}; }
+}
 
 function scheduleRpc(fn) {
   const run = async () => {
@@ -146,12 +168,14 @@ async function ponsMetrics(row) {
   const token = row.token_address;
   const launch = await readContract(CFG.ponsFactory, factoryAbi, 'getLaunchedToken', [getAddress(token)]);
   if (!launch?.exists || Number(launch.phase ?? 0) !== 0 || !validAddress(launch.curve)) return null;
-  const reserves = await readContract(launch.curve, curveAbi, 'getReserves');
-  if (!reserves) return null;
+  const [reserves, realQuote, qDecimals, qUsd] = await Promise.all([
+    readContract(launch.curve, curveAbi, 'getReserves'),
+    readContract(launch.curve, curveAbi, 'realQuoteReserve'),
+    quoteDecimals(launch.pairToken),
+    quoteUsd(launch.pairToken),
+  ]);
+  if (!reserves || qDecimals == null || qUsd == null) return null;
   const tokenDecimals = Number.isFinite(Number(row.decimals)) ? Number(row.decimals) : 18;
-  const qDecimals = await quoteDecimals(launch.pairToken);
-  const qUsd = await quoteUsd(launch.pairToken);
-  if (qDecimals == null || qUsd == null) return null;
   const quoteReserve = Number(formatUnits(BigInt(reserves[0]), qDecimals));
   const tokenReserve = Number(formatUnits(BigInt(reserves[1]), tokenDecimals));
   if (!(tokenReserve > 0) || !(quoteReserve >= 0)) return null;
@@ -160,6 +184,15 @@ async function ponsMetrics(row) {
   if (row.total_supply) {
     const supply = Number(formatUnits(BigInt(row.total_supply), tokenDecimals));
     if (Number.isFinite(supply)) marketCap = priceUsd * supply;
+  }
+  let reserveUsd = null;
+  let curveProgressPct = null;
+  if (realQuote != null) {
+    const realQuoteValue = Number(formatUnits(BigInt(realQuote), qDecimals));
+    if (Number.isFinite(realQuoteValue)) reserveUsd = realQuoteValue * qUsd;
+    if (launch.graduationThreshold != null && BigInt(launch.graduationThreshold) > 0n) {
+      curveProgressPct = Number(BigInt(realQuote) * 1_000_000n / BigInt(launch.graduationThreshold)) / 10_000;
+    }
   }
   return {
     priceUsd,
@@ -170,7 +203,15 @@ async function ponsMetrics(row) {
     volume5m: null,
     source: 'pons-curve',
     poolKey: text(launch.curve).toLowerCase(),
-    raw: { phase: Number(launch.phase ?? 0), pairToken: text(launch.pairToken) },
+    reserveUsd,
+    curveProgressPct,
+    phase: Number(launch.phase ?? 0),
+    raw: {
+      phase: Number(launch.phase ?? 0),
+      pairToken: text(launch.pairToken),
+      reserveUsd,
+      curveProgressPct,
+    },
   };
 }
 
@@ -189,10 +230,47 @@ async function marketMetrics(row) {
       volume5m: num(pair?.volume?.m5),
       source: text(pair?.dexId) || 'dexscreener',
       poolKey: text(pair?.pairAddress).toLowerCase() || row.first_pool_key,
+      reserveUsd: null,
+      curveProgressPct: null,
+      phase: null,
       raw: { pairAddress: pair?.pairAddress || '', dexId: pair?.dexId || '' },
     };
   }
   return ponsMetrics(row);
+}
+
+function ensureMarlinSchema() {
+  const db = getDatabase();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS marlin_30s (
+      token_address TEXT PRIMARY KEY,
+      first_seen_at TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      age_sec REAL,
+      stage_at_observation TEXT NOT NULL DEFAULT '',
+      initial_at TEXT,
+      initial_price_usd REAL,
+      price_usd REAL,
+      price_change_pct REAL,
+      initial_market_cap REAL,
+      market_cap REAL,
+      market_cap_change_pct REAL,
+      initial_reserve_usd REAL,
+      reserve_usd REAL,
+      reserve_change_pct REAL,
+      initial_curve_progress_pct REAL,
+      curve_progress_pct REAL,
+      curve_progress_delta REAL,
+      score_at_observation REAL,
+      graduated INTEGER NOT NULL DEFAULT 0,
+      source TEXT NOT NULL DEFAULT '',
+      raw_data TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(token_address) REFERENCES tokens(token_address)
+    );
+    CREATE INDEX IF NOT EXISTS idx_marlin30_observed ON marlin_30s(observed_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_marlin30_score ON marlin_30s(score_at_observation DESC);
+  `);
 }
 
 function dueCanaries() {
@@ -255,6 +333,42 @@ function dueShadows() {
   `).all(oldest, newest, CFG.shadowMinScore, cutoff, CFG.shadowBatchSize);
 }
 
+function dueMarlinWindows() {
+  if (!CFG.marlinEnabled) return [];
+  ensureMarlinSchema();
+  const db = getDatabase();
+  const now = Date.now();
+  const oldest = new Date(now - CFG.marlinMaxAgeMs).toISOString();
+  const newest = new Date(now - CFG.marlinMinAgeMs).toISOString();
+  return db.prepare(`
+    SELECT t.token_address, t.decimals, t.total_supply, t.first_pool_key,
+           t.first_seen_at, t.monitor_stage,
+           (
+             SELECT s.final_score FROM scores s
+             WHERE s.token_address=t.token_address
+             ORDER BY s.scored_at DESC, s.id DESC LIMIT 1
+           ) AS latest_score
+    FROM tokens t
+    WHERE t.first_source LIKE 'Pons%'
+      AND t.first_seen_at >= ?
+      AND t.first_seen_at <= ?
+      AND EXISTS (
+        SELECT 1 FROM snapshots x
+        WHERE x.token_address=t.token_address AND x.snapshot_type='INITIAL'
+      )
+      AND COALESCE((
+        SELECT s.final_score FROM scores s
+        WHERE s.token_address=t.token_address
+        ORDER BY s.scored_at DESC, s.id DESC LIMIT 1
+      ), 0) >= ?
+      AND NOT EXISTS (
+        SELECT 1 FROM marlin_30s w WHERE w.token_address=t.token_address
+      )
+    ORDER BY t.first_seen_at ASC
+    LIMIT ?
+  `).all(oldest, newest, CFG.marlinMinScore, CFG.marlinBatchSize);
+}
+
 async function trackRows(rows, label) {
   for (const row of rows) {
     if (stopping) return;
@@ -284,6 +398,103 @@ async function trackRows(rows, label) {
   }
 }
 
+function recordMarlinWindow(row, metrics) {
+  const db = getDatabase();
+  const initial = db.prepare(`
+    SELECT snapshot_at, price_usd, market_cap, raw_data
+    FROM snapshots
+    WHERE token_address=? AND snapshot_type='INITIAL'
+    ORDER BY snapshot_at ASC, id ASC LIMIT 1
+  `).get(row.token_address) || {};
+  const initialRaw = parseJson(initial.raw_data);
+  const initialPons = initialRaw?.pons || {};
+  const observedAt = new Date().toISOString();
+  const ageSec = Math.max(0, (new Date(observedAt).getTime() - new Date(row.first_seen_at).getTime()) / 1000);
+  const initialReserve = num(initialPons.reserveUsd);
+  const initialProgress = num(initialPons.curveProgressPct);
+  const reserve = num(metrics.reserveUsd);
+  let progress = num(metrics.curveProgressPct);
+  const graduated = metrics.source !== 'pons-curve';
+  if (graduated && progress == null) progress = 100;
+  const out = {
+    token_address: row.token_address,
+    first_seen_at: row.first_seen_at,
+    observed_at: observedAt,
+    age_sec: Math.round(ageSec * 10) / 10,
+    stage_at_observation: text(row.monitor_stage),
+    initial_at: initial.snapshot_at || null,
+    initial_price_usd: num(initial.price_usd),
+    price_usd: num(metrics.priceUsd),
+    price_change_pct: pctChange(metrics.priceUsd, initial.price_usd),
+    initial_market_cap: num(initial.market_cap),
+    market_cap: num(metrics.marketCap),
+    market_cap_change_pct: pctChange(metrics.marketCap, initial.market_cap),
+    initial_reserve_usd: initialReserve,
+    reserve_usd: reserve,
+    reserve_change_pct: pctChange(reserve, initialReserve),
+    initial_curve_progress_pct: initialProgress,
+    curve_progress_pct: progress,
+    curve_progress_delta: progress != null && initialProgress != null ? progress - initialProgress : null,
+    score_at_observation: num(row.latest_score),
+    graduated: graduated ? 1 : 0,
+    source: text(metrics.source),
+    raw_data: safeJson({ metrics, initialPons }),
+    created_at: observedAt,
+  };
+  db.prepare(`
+    INSERT OR IGNORE INTO marlin_30s (
+      token_address, first_seen_at, observed_at, age_sec, stage_at_observation,
+      initial_at, initial_price_usd, price_usd, price_change_pct,
+      initial_market_cap, market_cap, market_cap_change_pct,
+      initial_reserve_usd, reserve_usd, reserve_change_pct,
+      initial_curve_progress_pct, curve_progress_pct, curve_progress_delta,
+      score_at_observation, graduated, source, raw_data, created_at
+    ) VALUES (
+      @token_address, @first_seen_at, @observed_at, @age_sec, @stage_at_observation,
+      @initial_at, @initial_price_usd, @price_usd, @price_change_pct,
+      @initial_market_cap, @market_cap, @market_cap_change_pct,
+      @initial_reserve_usd, @reserve_usd, @reserve_change_pct,
+      @initial_curve_progress_pct, @curve_progress_pct, @curve_progress_delta,
+      @score_at_observation, @graduated, @source, @raw_data, @created_at
+    )
+  `).run(out);
+  return out;
+}
+
+async function captureMarlinWindows() {
+  for (const row of dueMarlinWindows()) {
+    if (stopping) return;
+    const metrics = await marketMetrics(row);
+    if (!metrics || num(metrics.priceUsd) == null) {
+      console.log('[marlin 30s pending]', JSON.stringify({ token: row.token_address, score: row.latest_score ?? null }));
+      continue;
+    }
+    const out = recordMarlinWindow(row, metrics);
+    console.log('[marlin 30s]', JSON.stringify({
+      token: out.token_address,
+      ageSec: out.age_sec,
+      stage: out.stage_at_observation,
+      score: out.score_at_observation,
+      priceChangePct: out.price_change_pct,
+      reserveUsd: out.reserve_usd,
+      reserveChangePct: out.reserve_change_pct,
+      curveProgressPct: out.curve_progress_pct,
+      curveProgressDelta: out.curve_progress_delta,
+      marketCap: out.market_cap,
+      graduated: Boolean(out.graduated),
+      source: out.source,
+    }));
+  }
+}
+
+async function marlinLoop() {
+  while (!stopping) {
+    try { await captureMarlinWindows(); }
+    catch (err) { console.error('[marlin 30s]', text(err?.message || err)); }
+    await sleep(CFG.marlinPollMs);
+  }
+}
+
 async function cycle() {
   await trackRows(dueCanaries(), 'canary');
   if (!stopping) await trackRows(dueShadows(), 'shadow');
@@ -293,9 +504,10 @@ async function main() {
   initializeDatabase();
   ensurePriceMilestoneSchema();
   ensureAthSchema();
+  ensureMarlinSchema();
   console.log('[canary tracker boot]', JSON.stringify({
     version: VERSION,
-    priority: 'new-canary-first-then-near-miss-shadow',
+    priority: 'marlin30-observe + new-canary-first + near-miss-shadow',
     cycleMs: CFG.cycleMs,
     minIntervalMs: CFG.minIntervalMs,
     batchSize: CFG.batchSize,
@@ -308,13 +520,23 @@ async function main() {
       intervalMs: CFG.shadowIntervalMs,
       batchSize: CFG.shadowBatchSize,
     },
+    marlin30: {
+      enabled: CFG.marlinEnabled,
+      minScore: CFG.marlinMinScore,
+      minAgeMs: CFG.marlinMinAgeMs,
+      maxAgeMs: CFG.marlinMaxAgeMs,
+      pollMs: CFG.marlinPollMs,
+      batchSize: CFG.marlinBatchSize,
+    },
     ...getAthHealth(),
   }));
+  const marlinTask = marlinLoop();
   while (!stopping) {
     try { await cycle(); }
     catch (err) { console.error('[canary tracker]', text(err?.message || err)); }
     await sleep(CFG.cycleMs);
   }
+  await marlinTask;
 }
 
 process.on('SIGTERM', () => { stopping = true; });
