@@ -1,11 +1,11 @@
 {
   "name": "rh-newcoin-scanner",
-  "version": "2.13.0",
+  "version": "2.14.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node src/runner.mjs",
-    "check": "node --check src/db.mjs && node --check src/risk.mjs && node --check src/scoring.mjs && node --check src/stages.mjs && node --check src/scanner_state.mjs && node --check src/dead_letter.mjs && node --check src/dead_letter_cli.mjs && node --check src/price_milestones.mjs && node --check src/ath_metrics.mjs && node --check src/canary_market_tracker.mjs && node --check src/ops_status.mjs && node --check src/sheet_sync.mjs && node --check src/persistence_proxy.mjs && node --check src/job_worker.mjs && node --check src/runner.mjs && node --check src/rh_newcoin_scanner.mjs && node --check src/enricher.mjs && node --check src/smoke.mjs",
+    "check": "node --check src/db.mjs && node --check src/risk.mjs && node --check src/scoring.mjs && node --check src/stages.mjs && node --check src/scanner_state.mjs && node --check src/dead_letter.mjs && node --check src/dead_letter_cli.mjs && node --check src/price_milestones.mjs && node --check src/ath_metrics.mjs && node --check src/canary_market_tracker.mjs && node --check src/ops_status.mjs && node --check src/sheet_data.mjs && node --check src/sheet_sync.mjs && node --check src/persistence_proxy.mjs && node --check src/job_worker.mjs && node --check src/runner.mjs && node --check src/rh_newcoin_scanner.mjs && node --check src/enricher.mjs && node --check src/smoke.mjs",
     "smoke": "node src/smoke.mjs",
     "dead-letters": "node src/dead_letter_cli.mjs list",
     "retry-job": "node src/dead_letter_cli.mjs retry"
