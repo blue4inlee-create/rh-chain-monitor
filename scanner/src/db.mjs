@@ -24,6 +24,11 @@ function safeJson(value) {
   }
 }
 
+function parseJson(value) {
+  try { return JSON.parse(String(value || '{}')); }
+  catch { return {}; }
+}
+
 function txt(v) {
   return v == null ? '' : String(v).trim();
 }
@@ -32,10 +37,22 @@ function lc(v) {
   return txt(v).toLowerCase();
 }
 
+function num(v) {
+  if (v === '' || v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 function poolKeyFor(event) {
   const pool = txt(event.pool);
   if (!pool) return '';
   return lc(pool);
+}
+
+function pctChange(current, initial) {
+  const a = num(current), b = num(initial);
+  if (a == null || b == null || b === 0) return null;
+  return ((a - b) / b) * 100;
 }
 
 function migrate(db) {
@@ -81,12 +98,65 @@ function migrate(db) {
       FOREIGN KEY(token_address) REFERENCES tokens(token_address)
     );
 
+    CREATE TABLE IF NOT EXISTS jobs (
+      job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      dedupe_key TEXT NOT NULL UNIQUE,
+      token_address TEXT NOT NULL,
+      pool_key TEXT NOT NULL DEFAULT '',
+      job_type TEXT NOT NULL,
+      run_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      max_retries INTEGER NOT NULL DEFAULT 4,
+      last_error TEXT NOT NULL DEFAULT '',
+      payload TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(token_address) REFERENCES tokens(token_address)
+    );
+
+    CREATE TABLE IF NOT EXISTS snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      snapshot_key TEXT NOT NULL UNIQUE,
+      job_id INTEGER,
+      token_address TEXT NOT NULL,
+      pool_key TEXT NOT NULL DEFAULT '',
+      snapshot_type TEXT NOT NULL,
+      snapshot_at TEXT NOT NULL,
+      price_usd REAL,
+      market_cap REAL,
+      fdv REAL,
+      liquidity_usd REAL,
+      buy_count INTEGER,
+      sell_count INTEGER,
+      buy_volume_usd REAL,
+      sell_volume_usd REAL,
+      volume_total_usd REAL,
+      holder_count INTEGER,
+      price_change_pct REAL,
+      market_cap_change_pct REAL,
+      liquidity_change_pct REAL,
+      dex TEXT NOT NULL DEFAULT '',
+      pair_address TEXT NOT NULL DEFAULT '',
+      source_status TEXT NOT NULL DEFAULT '',
+      raw_data TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(job_id) REFERENCES jobs(job_id),
+      FOREIGN KEY(token_address) REFERENCES tokens(token_address)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_pools_token_address ON pools(token_address);
     CREATE INDEX IF NOT EXISTS idx_pools_discovered_at ON pools(discovered_at);
     CREATE INDEX IF NOT EXISTS idx_pools_tx_hash ON pools(tx_hash);
     CREATE INDEX IF NOT EXISTS idx_tokens_first_seen_at ON tokens(first_seen_at);
+    CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(status, run_at);
+    CREATE INDEX IF NOT EXISTS idx_jobs_token ON jobs(token_address, job_type);
+    CREATE INDEX IF NOT EXISTS idx_snapshots_token ON snapshots(token_address, snapshot_at);
+    CREATE INDEX IF NOT EXISTS idx_snapshots_type ON snapshots(snapshot_type, snapshot_at);
   `);
-  db.pragma('user_version = 2');
+  db.pragma('user_version = 4');
 }
 
 export function openDatabase() {
@@ -169,6 +239,39 @@ const updatePoolSql = `
   WHERE pool_key = @pool_key
 `;
 
+function scheduleJobs(db, event, tokenAddress, poolKey, now) {
+  const stage = txt(event.stage);
+  if (!/(TokenLaunched|PoolInitialized|PoolCreated|Discovery)/i.test(stage)) return 0;
+  const anchor = poolKey || lc(event.txHash || event.discovery_tx) || tokenAddress;
+  const specs = [
+    ['ENRICH_INITIAL', 15_000],
+    ['SNAPSHOT_1M', 60_000],
+  ];
+  let created = 0;
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO jobs (
+      dedupe_key, token_address, pool_key, job_type, run_at, status,
+      retry_count, max_retries, payload, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, 4, ?, ?, ?)
+  `);
+  const payload = safeJson(event);
+  for (const [jobType, delayMs] of specs) {
+    const runAt = new Date(Date.now() + delayMs).toISOString();
+    const result = stmt.run(
+      `${jobType}:${tokenAddress}:${anchor}`,
+      tokenAddress,
+      poolKey,
+      jobType,
+      runAt,
+      payload,
+      now,
+      now,
+    );
+    created += result.changes;
+  }
+  return created;
+}
+
 export function persistDiscoveryEvent(event = {}) {
   const tokenAddress = lc(event.tokenCa || event.token_address);
   if (!/^0x[a-f0-9]{40}$/.test(tokenAddress)) {
@@ -240,18 +343,200 @@ export function persistDiscoveryEvent(event = {}) {
       }
     }
 
-    return { ok: true, tokenAddress, poolKey, poolInserted };
+    const jobsCreated = scheduleJobs(db, event, tokenAddress, poolKey, now);
+    return { ok: true, tokenAddress, poolKey, poolInserted, jobsCreated };
   });
 
   return tx();
+}
+
+export function claimDueJob() {
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  const stale = new Date(Date.now() - 10 * 60_000).toISOString();
+  return db.transaction(() => {
+    db.prepare(`
+      UPDATE jobs SET status='PENDING', started_at=NULL, updated_at=?
+      WHERE status='RUNNING' AND started_at IS NOT NULL AND started_at < ? AND retry_count < max_retries
+    `).run(now, stale);
+
+    const row = db.prepare(`
+      SELECT * FROM jobs
+      WHERE status='PENDING'
+        AND run_at <= ?
+        AND job_type IN ('ENRICH_INITIAL','SNAPSHOT_1M')
+      ORDER BY run_at ASC, job_id ASC
+      LIMIT 1
+    `).get(now);
+    if (!row) return null;
+
+    const claimed = db.prepare(`
+      UPDATE jobs SET status='RUNNING', started_at=?, updated_at=?
+      WHERE job_id=? AND status='PENDING'
+    `).run(now, now, row.job_id);
+    if (!claimed.changes) return null;
+    return { ...row, payload: parseJson(row.payload) };
+  })();
+}
+
+export function completeJob(jobId) {
+  const now = new Date().toISOString();
+  const result = getDatabase().prepare(`
+    UPDATE jobs SET status='DONE', finished_at=?, updated_at=?, last_error=''
+    WHERE job_id=?
+  `).run(now, now, jobId);
+  return result.changes > 0;
+}
+
+export function failJob(jobId, error) {
+  const db = getDatabase();
+  const row = db.prepare('SELECT retry_count, max_retries FROM jobs WHERE job_id=?').get(jobId);
+  if (!row) return { ok: false, reason: 'job_not_found' };
+  const retryCount = Number(row.retry_count || 0) + 1;
+  const failed = retryCount >= Number(row.max_retries || 4);
+  const delayMs = Math.min(60_000, 5_000 * (2 ** Math.max(0, retryCount - 1)));
+  const now = new Date().toISOString();
+  const runAt = new Date(Date.now() + delayMs).toISOString();
+  db.prepare(`
+    UPDATE jobs SET
+      status=?, retry_count=?, last_error=?, run_at=?, started_at=NULL,
+      finished_at=CASE WHEN ?='FAILED' THEN ? ELSE NULL END,
+      updated_at=?
+    WHERE job_id=?
+  `).run(
+    failed ? 'FAILED' : 'PENDING',
+    retryCount,
+    txt(error).slice(0, 1000),
+    runAt,
+    failed ? 'FAILED' : 'PENDING',
+    now,
+    now,
+    jobId,
+  );
+  return { ok: true, failed, retryCount, runAt };
+}
+
+export function updateTokenEnrichment(tokenAddress, data = {}) {
+  const token = lc(tokenAddress);
+  const now = new Date().toISOString();
+  getDatabase().prepare(`
+    UPDATE tokens SET
+      symbol = CASE WHEN ? <> '' THEN ? ELSE symbol END,
+      name = CASE WHEN ? <> '' THEN ? ELSE name END,
+      decimals = COALESCE(?, decimals),
+      total_supply = CASE WHEN ? <> '' THEN ? ELSE total_supply END,
+      last_seen_at = ?,
+      updated_at = ?
+    WHERE token_address = ?
+  `).run(
+    txt(data.symbol), txt(data.symbol),
+    txt(data.name), txt(data.name),
+    Number.isFinite(Number(data.decimals)) ? Number(data.decimals) : null,
+    txt(data.totalSupply), txt(data.totalSupply),
+    now, now, token,
+  );
+}
+
+export function saveSnapshot(job, data = {}) {
+  const db = getDatabase();
+  const tokenAddress = lc(job.token_address);
+  const poolKey = lc(job.pool_key || job.payload?.pool || '');
+  const snapshotType = job.job_type === 'SNAPSHOT_1M' ? '1M' : 'INITIAL';
+  const snapshotAt = new Date().toISOString();
+  const initial = snapshotType === '1M'
+    ? db.prepare(`
+        SELECT price_usd, market_cap, liquidity_usd
+        FROM snapshots
+        WHERE token_address=? AND snapshot_type='INITIAL'
+        ORDER BY snapshot_at DESC LIMIT 1
+      `).get(tokenAddress)
+    : null;
+
+  const row = {
+    snapshot_key: `${job.job_id}:${snapshotType}`,
+    job_id: Number(job.job_id),
+    token_address: tokenAddress,
+    pool_key: poolKey,
+    snapshot_type: snapshotType,
+    snapshot_at: snapshotAt,
+    price_usd: num(data.priceUsd),
+    market_cap: num(data.marketCap),
+    fdv: num(data.fdv),
+    liquidity_usd: num(data.liquidityUsd),
+    buy_count: num(data.buyCount),
+    sell_count: num(data.sellCount),
+    buy_volume_usd: num(data.buyVolumeUsd),
+    sell_volume_usd: num(data.sellVolumeUsd),
+    volume_total_usd: num(data.volumeTotalUsd),
+    holder_count: num(data.holderCount),
+    price_change_pct: pctChange(data.priceUsd, initial?.price_usd),
+    market_cap_change_pct: pctChange(data.marketCap, initial?.market_cap),
+    liquidity_change_pct: pctChange(data.liquidityUsd, initial?.liquidity_usd),
+    dex: txt(data.dex),
+    pair_address: lc(data.pairAddress),
+    source_status: txt(data.sourceStatus),
+    raw_data: safeJson(data.raw || data),
+    created_at: snapshotAt,
+  };
+
+  db.prepare(`
+    INSERT INTO snapshots (
+      snapshot_key, job_id, token_address, pool_key, snapshot_type, snapshot_at,
+      price_usd, market_cap, fdv, liquidity_usd, buy_count, sell_count,
+      buy_volume_usd, sell_volume_usd, volume_total_usd, holder_count,
+      price_change_pct, market_cap_change_pct, liquidity_change_pct,
+      dex, pair_address, source_status, raw_data, created_at
+    ) VALUES (
+      @snapshot_key, @job_id, @token_address, @pool_key, @snapshot_type, @snapshot_at,
+      @price_usd, @market_cap, @fdv, @liquidity_usd, @buy_count, @sell_count,
+      @buy_volume_usd, @sell_volume_usd, @volume_total_usd, @holder_count,
+      @price_change_pct, @market_cap_change_pct, @liquidity_change_pct,
+      @dex, @pair_address, @source_status, @raw_data, @created_at
+    )
+    ON CONFLICT(snapshot_key) DO UPDATE SET
+      snapshot_at=excluded.snapshot_at,
+      price_usd=excluded.price_usd,
+      market_cap=excluded.market_cap,
+      fdv=excluded.fdv,
+      liquidity_usd=excluded.liquidity_usd,
+      buy_count=excluded.buy_count,
+      sell_count=excluded.sell_count,
+      buy_volume_usd=excluded.buy_volume_usd,
+      sell_volume_usd=excluded.sell_volume_usd,
+      volume_total_usd=excluded.volume_total_usd,
+      holder_count=excluded.holder_count,
+      price_change_pct=excluded.price_change_pct,
+      market_cap_change_pct=excluded.market_cap_change_pct,
+      liquidity_change_pct=excluded.liquidity_change_pct,
+      dex=excluded.dex,
+      pair_address=excluded.pair_address,
+      source_status=excluded.source_status,
+      raw_data=excluded.raw_data
+  `).run(row);
+  return row;
 }
 
 export function getDatabaseHealth() {
   const db = getDatabase();
   const tokens = Number(db.prepare('SELECT COUNT(*) AS n FROM tokens').get()?.n || 0);
   const pools = Number(db.prepare('SELECT COUNT(*) AS n FROM pools').get()?.n || 0);
+  const snapshots = Number(db.prepare('SELECT COUNT(*) AS n FROM snapshots').get()?.n || 0);
+  const pendingJobs = Number(db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE status='PENDING'").get()?.n || 0);
+  const runningJobs = Number(db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE status='RUNNING'").get()?.n || 0);
+  const failedJobs = Number(db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE status='FAILED'").get()?.n || 0);
   const latest = db.prepare('SELECT MAX(updated_at) AS ts FROM tokens').get()?.ts || null;
-  return { dbPath: DB_PATH, dbTokens: tokens, dbPools: pools, dbLastWriteAt: latest };
+  const latestSnapshot = db.prepare('SELECT MAX(snapshot_at) AS ts FROM snapshots').get()?.ts || null;
+  return {
+    dbPath: DB_PATH,
+    dbTokens: tokens,
+    dbPools: pools,
+    dbSnapshots: snapshots,
+    dbPendingJobs: pendingJobs,
+    dbRunningJobs: runningJobs,
+    dbFailedJobs: failedJobs,
+    dbLastWriteAt: latest,
+    dbLastSnapshotAt: latestSnapshot,
+  };
 }
 
 export function closeDatabase() {
