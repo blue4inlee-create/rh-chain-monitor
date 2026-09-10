@@ -16,6 +16,7 @@ import {
 } from './db.mjs';
 import { saveRiskChecks } from './risk.mjs';
 import { saveScore } from './scoring.mjs';
+import { applyStageDecision } from './stages.mjs';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 const CFG = {
@@ -81,7 +82,7 @@ async function fetchJson(url, timeoutMs = 7000, headers = {}) {
     const res = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'rh-chain-monitor-job-worker/2.7',
+        'user-agent': 'rh-chain-monitor-job-worker/2.8',
         ...headers,
       },
       signal: AbortSignal.timeout(timeoutMs),
@@ -198,6 +199,7 @@ async function ponsCurveMetrics(token, tokenMeta) {
   let priceUsd = null;
   let marketCap = null;
   let reserveUsd = null;
+  let curveProgressPct = null;
   if (reserves && qDecimals != null && tokenMeta.decimals != null && qUsd != null) {
     const quoteReserve = Number(formatUnits(BigInt(reserves[0]), qDecimals));
     const tokenReserve = Number(formatUnits(BigInt(reserves[1]), tokenMeta.decimals));
@@ -211,6 +213,9 @@ async function ponsCurveMetrics(token, tokenMeta) {
     const qr = Number(formatUnits(BigInt(realQuote), qDecimals));
     if (Number.isFinite(qr)) reserveUsd = qr * qUsd;
   }
+  if (realQuote != null && launch?.graduationThreshold != null && BigInt(launch.graduationThreshold) > 0n) {
+    curveProgressPct = Number(BigInt(realQuote) * 1_000_000n / BigInt(launch.graduationThreshold)) / 10_000;
+  }
 
   return {
     isPons: true,
@@ -220,6 +225,7 @@ async function ponsCurveMetrics(token, tokenMeta) {
     priceUsd,
     marketCap,
     reserveUsd,
+    curveProgressPct,
     creatorTaxBps: Number(launch.creatorTaxBps ?? 0),
     buybackEnabled: Boolean(launch.buybackEnabled),
     poolFee: Number(launch.poolFee ?? 0),
@@ -300,6 +306,7 @@ async function enrichJob(job) {
     sourceStatus,
   });
   const score = saveScore({ snapshot, pons });
+  const stage = applyStageDecision({ snapshot, score, pons });
 
   completeJob(job.job_id);
   return {
@@ -314,6 +321,7 @@ async function enrichJob(job) {
     sells: snapshot.sell_count,
     holders: snapshot.holder_count,
     priceChangePct: snapshot.price_change_pct,
+    curveProgressPct: pons.curveProgressPct,
     risk: risk.counts,
     score: {
       final: score.final_score,
@@ -321,6 +329,7 @@ async function enrichJob(job) {
       alpha: score.alpha_score,
       version: score.score_version,
     },
+    stage,
     status: snapshot.source_status,
   };
 }
@@ -328,7 +337,7 @@ async function enrichJob(job) {
 async function main() {
   const db = initializeDatabase();
   console.log('[job worker boot]', JSON.stringify({
-    version: '2.7.0',
+    version: '2.8.0',
     pollMs: CFG.pollMs,
     blockscoutKeyConfigured: Boolean(CFG.blockscoutKey),
     ...db,
@@ -344,6 +353,7 @@ async function main() {
     try {
       const result = await enrichJob(job);
       console.log('[job done]', JSON.stringify(result));
+      if (result.stage?.changed) console.log('[stage change]', JSON.stringify({ token: result.token, ...result.stage }));
     } catch (err) {
       const failed = failJob(job.job_id, err?.message || err);
       console.error('[job error]', JSON.stringify({
