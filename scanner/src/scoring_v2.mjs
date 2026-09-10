@@ -14,6 +14,34 @@ function safeJson(v) {
   try { return JSON.stringify(v); } catch { return '{}'; }
 }
 
+export function ensureScoreV2Schema() {
+  const db = getDatabase();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS scores_v2_shadow (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      score_key TEXT NOT NULL UNIQUE,
+      token_address TEXT NOT NULL,
+      pool_key TEXT NOT NULL DEFAULT '',
+      snapshot_type TEXT NOT NULL DEFAULT 'M30',
+      structural_score REAL NOT NULL DEFAULT 0,
+      price_quality_score REAL NOT NULL DEFAULT 0,
+      reserve_level_score REAL NOT NULL DEFAULT 0,
+      reserve_velocity_score REAL NOT NULL DEFAULT 0,
+      progress_velocity_score REAL NOT NULL DEFAULT 0,
+      alpha_bonus REAL NOT NULL DEFAULT 0,
+      penalty_score REAL NOT NULL DEFAULT 0,
+      final_score REAL NOT NULL DEFAULT 0,
+      confidence REAL NOT NULL DEFAULT 0,
+      score_version TEXT NOT NULL,
+      reason_json TEXT NOT NULL DEFAULT '{}',
+      scored_at TEXT NOT NULL,
+      FOREIGN KEY(token_address) REFERENCES tokens(token_address)
+    );
+    CREATE INDEX IF NOT EXISTS idx_scores_v2_token ON scores_v2_shadow(token_address, scored_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_scores_v2_final ON scores_v2_shadow(final_score DESC, scored_at DESC);
+  `);
+}
+
 function reserveLevelScore(reserve) {
   const r = num(reserve);
   if (r == null) return 0;
@@ -80,6 +108,7 @@ function structuralScore(v1) {
 }
 
 export function calculateM30ScoreV2(tokenAddress) {
+  ensureScoreV2Schema();
   const db = getDatabase();
   const token = String(tokenAddress || '').trim().toLowerCase();
   const m30 = db.prepare('SELECT * FROM marlin_30s WHERE token_address=?').get(token);
@@ -128,12 +157,13 @@ export function calculateM30ScoreV2(tokenAddress) {
     token_address: token,
     pool_key: String(v1.pool_key || '').toLowerCase(),
     snapshot_type: 'M30',
-    discovery_score: structural,
-    momentum_score: priceQuality + progressVelocity,
-    liquidity_score: reserveLevel,
-    flow_score: reserveVelocity,
-    risk_score: clamp(15 - penalty, 0, 15),
-    alpha_score: alphaBonus,
+    structural_score: structural,
+    price_quality_score: priceQuality,
+    reserve_level_score: reserveLevel,
+    reserve_velocity_score: reserveVelocity,
+    progress_velocity_score: progressVelocity,
+    alpha_bonus: alphaBonus,
+    penalty_score: penalty,
     final_score: final,
     confidence,
     score_version: SCORE_V2_VERSION,
@@ -166,28 +196,46 @@ export function saveM30ScoreV2(tokenAddress) {
   const scoredAt = new Date().toISOString();
   const key = `${score.token_address}:${score.pool_key}:${score.snapshot_type}:${score.score_version}`;
   db.prepare(`
-    INSERT INTO scores (
+    INSERT INTO scores_v2_shadow (
       score_key, token_address, pool_key, snapshot_type,
-      discovery_score, momentum_score, liquidity_score, flow_score,
-      risk_score, alpha_score, final_score, confidence,
-      score_version, reason_json, scored_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      structural_score, price_quality_score, reserve_level_score,
+      reserve_velocity_score, progress_velocity_score, alpha_bonus,
+      penalty_score, final_score, confidence, score_version, reason_json, scored_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(score_key) DO UPDATE SET
-      discovery_score=excluded.discovery_score,
-      momentum_score=excluded.momentum_score,
-      liquidity_score=excluded.liquidity_score,
-      flow_score=excluded.flow_score,
-      risk_score=excluded.risk_score,
-      alpha_score=excluded.alpha_score,
+      structural_score=excluded.structural_score,
+      price_quality_score=excluded.price_quality_score,
+      reserve_level_score=excluded.reserve_level_score,
+      reserve_velocity_score=excluded.reserve_velocity_score,
+      progress_velocity_score=excluded.progress_velocity_score,
+      alpha_bonus=excluded.alpha_bonus,
+      penalty_score=excluded.penalty_score,
       final_score=excluded.final_score,
       confidence=excluded.confidence,
       reason_json=excluded.reason_json,
       scored_at=excluded.scored_at
   `).run(
     key, score.token_address, score.pool_key, score.snapshot_type,
-    score.discovery_score, score.momentum_score, score.liquidity_score, score.flow_score,
-    score.risk_score, score.alpha_score, score.final_score, score.confidence,
+    score.structural_score, score.price_quality_score, score.reserve_level_score,
+    score.reserve_velocity_score, score.progress_velocity_score, score.alpha_bonus,
+    score.penalty_score, score.final_score, score.confidence,
     score.score_version, safeJson(score.reason), scoredAt,
   );
   return { ...score, scored_at: scoredAt };
+}
+
+export function getScoreV2Health() {
+  ensureScoreV2Schema();
+  const db = getDatabase();
+  const row = db.prepare(`
+    SELECT COUNT(*) AS n, AVG(final_score) AS avg_score, MAX(final_score) AS max_score, MAX(scored_at) AS latest
+    FROM scores_v2_shadow
+  `).get() || {};
+  return {
+    scoresV2: Number(row.n || 0),
+    avgScoreV2: num(row.avg_score),
+    maxScoreV2: num(row.max_score),
+    latestScoreV2At: row.latest || null,
+    version: SCORE_V2_VERSION,
+  };
 }
