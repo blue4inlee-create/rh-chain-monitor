@@ -36,8 +36,12 @@ function startEnricher() {
   if (stopping || !LEGACY_ENRICHER) return;
   enricher = spawnNode('enricher.mjs', 'enricher');
   enricher.on('exit', (code, signal) => {
+    if (stopping) {
+      console.log(`[runner enricher] stopped code=${code ?? ''} signal=${signal || ''}`);
+      return;
+    }
     console.error(`[runner enricher] exited code=${code} signal=${signal || ''}`);
-    if (!stopping) setTimeout(startEnricher, 5000).unref();
+    setTimeout(startEnricher, 5000).unref();
   });
 }
 
@@ -45,8 +49,12 @@ function startJobWorker() {
   if (stopping) return;
   jobWorker = spawnNode('job_worker.mjs', 'job-worker');
   jobWorker.on('exit', (code, signal) => {
+    if (stopping) {
+      console.log(`[runner job-worker] stopped code=${code ?? ''} signal=${signal || ''}`);
+      return;
+    }
     console.error(`[runner job-worker] exited code=${code} signal=${signal || ''}`);
-    if (!stopping) setTimeout(startJobWorker, 5000).unref();
+    setTimeout(startJobWorker, 5000).unref();
   });
 }
 
@@ -91,7 +99,7 @@ async function main() {
 
   await Promise.all([rm(QUEUE_PATH, { force: true }), rm(OFFSET_PATH, { force: true })]);
   console.log('[runner] starting scanner + workers', JSON.stringify({
-    version: '2.9.0',
+    version: '2.9.1',
     sqliteFirst: true,
     sqliteJobs: true,
     persistentCursor: true,
@@ -108,13 +116,17 @@ async function main() {
   });
 
   scanner.on('exit', (code, signal) => {
-    console.error(`[runner scanner] exited code=${code} signal=${signal || ''}`);
+    if (stopping) {
+      console.log(`[runner scanner] stopped code=${code ?? ''} signal=${signal || ''}`);
+      return;
+    }
+    console.error(`[runner scanner] exited unexpectedly code=${code} signal=${signal || ''}`);
     stopping = true;
     if (enricher && !enricher.killed) enricher.kill('SIGTERM');
     if (jobWorker && !jobWorker.killed) jobWorker.kill('SIGTERM');
     if (persistenceProxy) persistenceProxy.close();
     closeDatabase();
-    process.exitCode = code ?? 1;
+    process.exitCode = code && code > 0 ? code : 1;
   });
 
   function shutdown(signal) {
@@ -126,7 +138,7 @@ async function main() {
     if (jobWorker && !jobWorker.killed) jobWorker.kill(signal);
     if (persistenceProxy) persistenceProxy.close();
     closeDatabase();
-    setTimeout(() => process.exit(0), 8000).unref();
+    setTimeout(() => process.exit(0), 1500).unref();
   }
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
