@@ -224,6 +224,31 @@ export function saveM30ScoreV2(tokenAddress) {
   return { ...score, scored_at: scoredAt };
 }
 
+export function backfillM30ScoresV2(limit=500) {
+  ensureScoreV2Schema();
+  const db = getDatabase();
+  const rows = db.prepare(`
+    SELECT m.token_address
+    FROM marlin_30s m
+    WHERE EXISTS (
+      SELECT 1 FROM scores s
+      WHERE s.token_address=m.token_address
+        AND s.snapshot_type='INITIAL'
+        AND s.score_version='score-v1.0'
+    )
+      AND NOT EXISTS (
+        SELECT 1 FROM scores_v2_shadow v WHERE v.token_address=m.token_address
+      )
+    ORDER BY m.observed_at ASC
+    LIMIT ?
+  `).all(Math.max(1, Math.min(2000, Number(limit) || 500)));
+  let saved = 0;
+  for (const row of rows) {
+    if (saveM30ScoreV2(row.token_address)) saved++;
+  }
+  return { candidates: rows.length, saved, ...getScoreV2Health() };
+}
+
 export function getScoreV2Health() {
   ensureScoreV2Schema();
   const db = getDatabase();
