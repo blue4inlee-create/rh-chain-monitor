@@ -28,6 +28,7 @@ const CFG = {
   blockscoutKey: String(process.env.BLOCKSCOUT_API_KEY || '').trim(),
   blockscoutProBase: (process.env.BLOCKSCOUT_PRO_BASE || 'https://api.blockscout.com/4663/api/v2').replace(/\/$/, ''),
   pollMs: Math.max(500, Number(process.env.JOB_POLL_MS || 1000)),
+  rpcGapMs: Math.max(25, Number(process.env.ENRICH_RPC_GAP_MS || 120)),
 };
 
 const client = createPublicClient({
@@ -37,7 +38,7 @@ const client = createPublicClient({
     nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
     rpcUrls: { default: { http: [CFG.rpc] } },
   },
-  transport: http(CFG.rpc, { timeout: 15000, retryCount: 1 }),
+  transport: http(CFG.rpc, { timeout: 15000, retryCount: 0 }),
 });
 
 const erc20Abi = parseAbi([
@@ -58,6 +59,10 @@ const curveAbi = parseAbi([
 
 const quotePriceCache = new Map();
 const quoteDecimalsCache = new Map();
+let rpcTail = Promise.resolve();
+let rpcLastAt = 0;
+let rpcRateLimits = 0;
+let rpcErrors = 0;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -76,13 +81,52 @@ function validAddress(v) {
 function nativeQuote(v) {
   return !v || text(v).toLowerCase() === ZERO;
 }
+function isRateLimit(err) {
+  const s = text(err?.message || err);
+  return /429|rate.?limit|too many requests|-32005/i.test(s);
+}
+
+function scheduleRpc(fn) {
+  const run = async () => {
+    const gap = CFG.rpcGapMs - (Date.now() - rpcLastAt);
+    if (gap > 0) await sleep(gap);
+    try {
+      return await fn();
+    } finally {
+      rpcLastAt = Date.now();
+    }
+  };
+  const p = rpcTail.then(run, run);
+  rpcTail = p.catch(() => {});
+  return p;
+}
+
+async function rpcWithRetry(fn) {
+  const waits = [0, 900, 3000];
+  let last = null;
+  for (let i = 0; i < waits.length; i++) {
+    if (waits[i]) await sleep(waits[i]);
+    try {
+      return await scheduleRpc(fn);
+    } catch (err) {
+      last = err;
+      if (!isRateLimit(err) || i === waits.length - 1) {
+        rpcErrors++;
+        throw err;
+      }
+      rpcRateLimits++;
+      console.warn('[rpc throttle]', JSON.stringify({ attempt: i + 1, waitMs: waits[Math.min(i + 1, waits.length - 1)], rateLimits: rpcRateLimits }));
+    }
+  }
+  throw last;
+}
 
 async function fetchJson(url, timeoutMs = 7000, headers = {}) {
   try {
     const res = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'rh-chain-monitor-job-worker/2.8',
+        'user-agent': 'rh-chain-monitor-job-worker/2.9.1',
         ...headers,
       },
       signal: AbortSignal.timeout(timeoutMs),
@@ -97,7 +141,7 @@ async function fetchJson(url, timeoutMs = 7000, headers = {}) {
 async function readContract(address, abi, functionName, args = []) {
   if (!validAddress(address)) return null;
   try {
-    return await client.readContract({ address: getAddress(address), abi, functionName, args });
+    return await rpcWithRetry(() => client.readContract({ address: getAddress(address), abi, functionName, args }));
   } catch {
     return null;
   }
@@ -295,6 +339,7 @@ async function enrichJob(job) {
       blockscoutMeta: blockscout.meta.data,
       blockscoutCounters: blockscout.holders.data,
       dexPair: pair,
+      rpc: { gapMs: CFG.rpcGapMs, rateLimits: rpcRateLimits, errors: rpcErrors },
     },
   });
 
@@ -330,6 +375,7 @@ async function enrichJob(job) {
       version: score.score_version,
     },
     stage,
+    rpc: { rateLimits: rpcRateLimits, errors: rpcErrors, gapMs: CFG.rpcGapMs },
     status: snapshot.source_status,
   };
 }
@@ -337,8 +383,9 @@ async function enrichJob(job) {
 async function main() {
   const db = initializeDatabase();
   console.log('[job worker boot]', JSON.stringify({
-    version: '2.8.0',
+    version: '2.9.1',
     pollMs: CFG.pollMs,
+    rpcGapMs: CFG.rpcGapMs,
     blockscoutKeyConfigured: Boolean(CFG.blockscoutKey),
     ...db,
   }));
@@ -361,6 +408,7 @@ async function main() {
         type: job.job_type,
         token: job.token_address,
         error: text(err?.message || err),
+        rpc: { rateLimits: rpcRateLimits, errors: rpcErrors },
         ...failed,
       }));
     }
