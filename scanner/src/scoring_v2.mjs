@@ -1,4 +1,5 @@
 import { getDatabase } from './db.mjs';
+import { refreshShadowStages } from './stage_ladder_shadow.mjs';
 
 export const SCORE_V2_VERSION = 'score-v2.0-shadow';
 
@@ -246,7 +247,13 @@ export function backfillM30ScoresV2(limit=500) {
   for (const row of rows) {
     if (saveM30ScoreV2(row.token_address)) saved++;
   }
-  return { candidates: rows.length, saved, ...getScoreV2Health() };
+  let ladder = null;
+  try {
+    ladder = refreshShadowStages({ limit: 1000 });
+  } catch (err) {
+    ladder = { error: String(err?.message || err) };
+  }
+  return { candidates: rows.length, saved, ladder, ...getScoreV2Health() };
 }
 
 export function getScoreV2Health() {
