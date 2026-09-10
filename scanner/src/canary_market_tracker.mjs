@@ -1,0 +1,262 @@
+import {
+  createPublicClient,
+  http,
+  parseAbi,
+  getAddress,
+  formatUnits,
+} from 'viem';
+import { initializeDatabase, getDatabase, closeDatabase } from './db.mjs';
+import { ensurePriceMilestoneSchema } from './price_milestones.mjs';
+import { ensureAthSchema, recordMarketTick, getAthHealth } from './ath_metrics.mjs';
+
+const ZERO = '0x0000000000000000000000000000000000000000';
+const CFG = {
+  chainId: 4663,
+  rpc: process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com',
+  chain: process.env.DEXSCREENER_CHAIN_ID || 'robinhood',
+  ponsFactory: process.env.PONS_V2_FACTORY || '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e',
+  weth: (process.env.WETH || '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73').toLowerCase(),
+  cycleMs: Math.max(15_000, Number(process.env.CANARY_TRACK_CYCLE_MS || 30_000)),
+  minIntervalMs: Math.max(60_000, Number(process.env.CANARY_TRACK_INTERVAL_MS || 300_000)),
+  batchSize: Math.max(1, Math.min(20, Number(process.env.CANARY_TRACK_BATCH || 4))),
+  rpcGapMs: Math.max(150, Number(process.env.CANARY_TRACK_RPC_GAP_MS || 300)),
+};
+
+const client = createPublicClient({
+  chain: {
+    id: CFG.chainId,
+    name: 'Robinhood Chain',
+    nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+    rpcUrls: { default: { http: [CFG.rpc] } },
+  },
+  transport: http(CFG.rpc, { timeout: 15_000, retryCount: 0 }),
+});
+
+const erc20Abi = parseAbi(['function decimals() view returns (uint8)']);
+const factoryAbi = parseAbi([
+  'struct LaunchedToken { address token; address curve; address deployer; address creatorFeeRecipient; address pairToken; uint256 graduationThreshold; uint24 poolFee; int24 tickSpacing; uint16 creatorTaxBps; bool buybackEnabled; uint8 phase; uint256 sweptQuote; uint256 sweptTokens; uint256 sweptAt; bool exists; }',
+  'function getLaunchedToken(address token) view returns (LaunchedToken)',
+]);
+const curveAbi = parseAbi(['function getReserves() view returns (uint256 quoteReserve, uint256 tokenReserve)']);
+
+const quoteDecimalsCache = new Map();
+const quotePriceCache = new Map();
+let rpcTail = Promise.resolve();
+let rpcLastAt = 0;
+let stopping = false;
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function text(v) { return v == null ? '' : String(v).trim(); }
+function num(v) {
+  if (v === '' || v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function validAddress(v) { return /^0x[a-fA-F0-9]{40}$/.test(text(v)); }
+function nativeQuote(v) { return !v || text(v).toLowerCase() === ZERO; }
+function rateLimited(err) { return /429|rate.?limit|too many requests|-32005/i.test(text(err?.message || err)); }
+
+function scheduleRpc(fn) {
+  const run = async () => {
+    const gap = CFG.rpcGapMs - (Date.now() - rpcLastAt);
+    if (gap > 0) await sleep(gap);
+    try { return await fn(); }
+    finally { rpcLastAt = Date.now(); }
+  };
+  const p = rpcTail.then(run, run);
+  rpcTail = p.catch(() => {});
+  return p;
+}
+
+async function readContract(address, abi, functionName, args = []) {
+  if (!validAddress(address)) return null;
+  for (const delay of [0, 1500, 5000]) {
+    if (delay) await sleep(delay);
+    try {
+      return await scheduleRpc(() => client.readContract({ address: getAddress(address), abi, functionName, args }));
+    } catch (err) {
+      if (!rateLimited(err)) return null;
+    }
+  }
+  return null;
+}
+
+async function fetchJson(url, timeoutMs = 7000) {
+  try {
+    const res = await fetch(url, {
+      headers: { accept: 'application/json', 'user-agent': 'rh-canary-market-tracker/2.12.0' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return { ok: false, status: res.status, data: null };
+    return { ok: true, status: res.status, data: await res.json() };
+  } catch (err) {
+    return { ok: false, status: 0, error: text(err?.message || err), data: null };
+  }
+}
+
+async function dexPairs(token) {
+  const r = await fetchJson(`https://api.dexscreener.com/token-pairs/v1/${CFG.chain}/${token}`);
+  return r.ok && Array.isArray(r.data) ? r.data : [];
+}
+function bestPair(pairs, preferredPool = '') {
+  const list = Array.isArray(pairs) ? pairs : [];
+  const preferred = text(preferredPool).toLowerCase();
+  if (preferred) {
+    const exact = list.find(p => text(p?.pairAddress).toLowerCase() === preferred);
+    if (exact) return exact;
+  }
+  return [...list].sort((a, b) => Number(b?.liquidity?.usd || 0) - Number(a?.liquidity?.usd || 0))[0] || null;
+}
+
+async function quoteDecimals(quote) {
+  if (nativeQuote(quote)) return 18;
+  const key = text(quote).toLowerCase();
+  if (quoteDecimalsCache.has(key)) return quoteDecimalsCache.get(key);
+  const d = await readContract(quote, erc20Abi, 'decimals');
+  const n = d == null ? null : Number(d);
+  if (n != null) quoteDecimalsCache.set(key, n);
+  return n;
+}
+
+async function quoteUsd(quote) {
+  const key = nativeQuote(quote) ? 'eth' : text(quote).toLowerCase();
+  const cached = quotePriceCache.get(key);
+  if (cached && Date.now() - cached.at < 60_000) return cached.price;
+  let price = null;
+  if (nativeQuote(quote) || key === CFG.weth) {
+    const r = await fetchJson('https://api.coinbase.com/v2/prices/ETH-USD/spot', 5000);
+    price = num(r.data?.data?.amount);
+  }
+  if (price == null && validAddress(quote)) {
+    const pair = bestPair(await dexPairs(quote));
+    price = num(pair?.priceUsd);
+  }
+  if (price != null && price > 0) quotePriceCache.set(key, { price, at: Date.now() });
+  return price;
+}
+
+async function ponsMetrics(row) {
+  const token = row.token_address;
+  const launch = await readContract(CFG.ponsFactory, factoryAbi, 'getLaunchedToken', [getAddress(token)]);
+  if (!launch?.exists || Number(launch.phase ?? 0) !== 0 || !validAddress(launch.curve)) return null;
+  const reserves = await readContract(launch.curve, curveAbi, 'getReserves');
+  if (!reserves) return null;
+  const tokenDecimals = Number.isFinite(Number(row.decimals)) ? Number(row.decimals) : 18;
+  const qDecimals = await quoteDecimals(launch.pairToken);
+  const qUsd = await quoteUsd(launch.pairToken);
+  if (qDecimals == null || qUsd == null) return null;
+  const quoteReserve = Number(formatUnits(BigInt(reserves[0]), qDecimals));
+  const tokenReserve = Number(formatUnits(BigInt(reserves[1]), tokenDecimals));
+  if (!(tokenReserve > 0) || !(quoteReserve >= 0)) return null;
+  const priceUsd = (quoteReserve / tokenReserve) * qUsd;
+  let marketCap = null;
+  if (row.total_supply) {
+    const supply = Number(formatUnits(BigInt(row.total_supply), tokenDecimals));
+    if (Number.isFinite(supply)) marketCap = priceUsd * supply;
+  }
+  return {
+    priceUsd,
+    marketCap,
+    liquidityUsd: null,
+    buyCount5m: null,
+    sellCount5m: null,
+    volume5m: null,
+    source: 'pons-curve',
+    poolKey: text(launch.curve).toLowerCase(),
+    raw: { phase: Number(launch.phase ?? 0), pairToken: text(launch.pairToken) },
+  };
+}
+
+async function marketMetrics(row) {
+  const pairs = await dexPairs(row.token_address);
+  const pair = bestPair(pairs, row.first_pool_key);
+  const price = num(pair?.priceUsd);
+  if (price != null && price > 0) {
+    const txns = pair?.txns?.m5 || {};
+    return {
+      priceUsd: price,
+      marketCap: num(pair?.marketCap) ?? num(pair?.fdv),
+      liquidityUsd: num(pair?.liquidity?.usd),
+      buyCount5m: num(txns?.buys),
+      sellCount5m: num(txns?.sells),
+      volume5m: num(pair?.volume?.m5),
+      source: text(pair?.dexId) || 'dexscreener',
+      poolKey: text(pair?.pairAddress).toLowerCase() || row.first_pool_key,
+      raw: { pairAddress: pair?.pairAddress || '', dexId: pair?.dexId || '' },
+    };
+  }
+  return ponsMetrics(row);
+}
+
+function dueCanaries() {
+  const db = getDatabase();
+  const cutoff = new Date(Date.now() - CFG.minIntervalMs).toISOString();
+  return db.prepare(`
+    SELECT t.token_address, t.decimals, t.total_supply, t.first_pool_key, t.canary_at,
+           MAX(m.tick_at) AS last_tick_at
+    FROM tokens t
+    LEFT JOIN market_ticks m ON m.token_address=t.token_address
+    WHERE t.monitor_stage IN ('CANARY','EARLY_ALPHA','CONFIRMED_ALPHA','SIZE_UP')
+    GROUP BY t.token_address
+    HAVING last_tick_at IS NULL OR last_tick_at <= ?
+    ORDER BY COALESCE(last_tick_at, t.canary_at, t.first_seen_at) ASC
+    LIMIT ?
+  `).all(cutoff, CFG.batchSize);
+}
+
+async function cycle() {
+  for (const row of dueCanaries()) {
+    if (stopping) return;
+    const metrics = await marketMetrics(row);
+    if (!metrics) {
+      console.log('[canary tick pending]', JSON.stringify({ token: row.token_address }));
+      continue;
+    }
+    const result = recordMarketTick({
+      tokenAddress: row.token_address,
+      poolKey: metrics.poolKey,
+      tickAt: new Date().toISOString(),
+      ...metrics,
+      raw: metrics.raw,
+    });
+    console.log('[canary tick]', JSON.stringify({
+      token: row.token_address,
+      price: metrics.priceUsd,
+      marketCap: metrics.marketCap,
+      liquidity: metrics.liquidityUsd,
+      source: metrics.source,
+      discoveryMultiple: result.discoveryMultiple,
+      canaryMultiple: result.canaryMultiple,
+      newAth: result.newAthPrice,
+    }));
+  }
+}
+
+async function main() {
+  initializeDatabase();
+  ensurePriceMilestoneSchema();
+  ensureAthSchema();
+  console.log('[canary tracker boot]', JSON.stringify({
+    version: '2.12.0',
+    cycleMs: CFG.cycleMs,
+    minIntervalMs: CFG.minIntervalMs,
+    batchSize: CFG.batchSize,
+    rpcGapMs: CFG.rpcGapMs,
+    ...getAthHealth(),
+  }));
+  while (!stopping) {
+    try { await cycle(); }
+    catch (err) { console.error('[canary tracker]', text(err?.message || err)); }
+    await sleep(CFG.cycleMs);
+  }
+}
+
+process.on('SIGTERM', () => { stopping = true; });
+process.on('SIGINT', () => { stopping = true; });
+
+main().catch(err => {
+  console.error('[canary tracker fatal]', err);
+  process.exitCode = 1;
+}).finally(() => {
+  try { closeDatabase(); } catch {}
+});
