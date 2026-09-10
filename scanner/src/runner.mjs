@@ -7,8 +7,9 @@ import { ensurePriceMilestoneSchema, getPriceMilestoneHealth } from './price_mil
 import { ensureAthSchema, getAthHealth } from './ath_metrics.mjs';
 import { startPersistenceProxy } from './persistence_proxy.mjs';
 import { ensureOpsSchema, recordOpsEvent, writeRuntimeStatus, STATUS_PATH } from './ops_status.mjs';
+import { buildSheetPayload, rowsToCsv } from './sheet_data.mjs';
 
-const VERSION = '2.13.0';
+const VERSION = '2.14.0';
 const ROOT = new URL('.', import.meta.url);
 const QUEUE_PATH = process.env.ENRICH_QUEUE_PATH || '/tmp/rh_enrich_queue.jsonl';
 const OFFSET_PATH = process.env.ENRICH_OFFSET_PATH || '/tmp/rh_enrich_queue.offset';
@@ -19,6 +20,7 @@ const PERSIST_PROXY_PORT = Number(process.env.PERSIST_PROXY_PORT || 3101);
 const UPSTREAM_SHEET_WEBHOOK_URL = String(process.env.SHEET_WEBHOOK_URL || '').trim();
 const RESULT_SHEET_WEBHOOK_URL = String(process.env.RESULT_SHEET_WEBHOOK_URL || '').trim();
 const UPSTREAM_SHEET_SECRET = String(process.env.SHEET_INGEST_SECRET || '').trim();
+const RESULT_EXPORT_TOKEN = String(process.env.RESULT_EXPORT_TOKEN || '').trim();
 const LOCAL_PERSIST_SECRET = 'sqlite-local-ingest';
 const LEGACY_ENRICHER = /^(1|true|yes)$/i.test(String(process.env.LEGACY_ENRICHER_ENABLED || 'false'));
 let stopping = false;
@@ -30,6 +32,7 @@ let sheetSync = null;
 let persistenceProxy = null;
 let healthServer = null;
 let runtimeTimer = null;
+let exportCache = { at: 0, payload: null };
 
 function spawnNode(file, label, extraEnv = {}) {
   const child = spawn(process.execPath, [new URL(file, ROOT).pathname], {
@@ -53,10 +56,7 @@ function startEnricher() {
   if (stopping || !LEGACY_ENRICHER) return;
   enricher = spawnNode('enricher.mjs', 'enricher');
   enricher.on('exit', (code, signal) => {
-    if (stopping) {
-      console.log(`[runner enricher] stopped code=${code ?? ''} signal=${signal || ''}`);
-      return;
-    }
+    if (stopping) return console.log(`[runner enricher] stopped code=${code ?? ''} signal=${signal || ''}`);
     console.error(`[runner enricher] exited code=${code} signal=${signal || ''}`);
     try { recordOpsEvent({ level:'ERROR', component:'enricher', event:'unexpected_exit', details:{ code, signal } }); } catch {}
     setTimeout(startEnricher, 5000).unref();
@@ -67,10 +67,7 @@ function startJobWorker() {
   if (stopping) return;
   jobWorker = spawnNode('job_worker.mjs', 'job-worker');
   jobWorker.on('exit', (code, signal) => {
-    if (stopping) {
-      console.log(`[runner job-worker] stopped code=${code ?? ''} signal=${signal || ''}`);
-      return;
-    }
+    if (stopping) return console.log(`[runner job-worker] stopped code=${code ?? ''} signal=${signal || ''}`);
     console.error(`[runner job-worker] exited code=${code} signal=${signal || ''}`);
     try { recordOpsEvent({ level:'ERROR', component:'job-worker', event:'unexpected_exit', details:{ code, signal } }); } catch {}
     setTimeout(startJobWorker, 5000).unref();
@@ -81,10 +78,7 @@ function startMarketTracker() {
   if (stopping) return;
   marketTracker = spawnNode('canary_market_tracker.mjs', 'canary-market-tracker');
   marketTracker.on('exit', (code, signal) => {
-    if (stopping) {
-      console.log(`[runner canary-market-tracker] stopped code=${code ?? ''} signal=${signal || ''}`);
-      return;
-    }
+    if (stopping) return console.log(`[runner canary-market-tracker] stopped code=${code ?? ''} signal=${signal || ''}`);
     console.error(`[runner canary-market-tracker] exited code=${code} signal=${signal || ''}`);
     try { recordOpsEvent({ level:'ERROR', component:'canary-market-tracker', event:'unexpected_exit', details:{ code, signal } }); } catch {}
     setTimeout(startMarketTracker, 5000).unref();
@@ -98,10 +92,7 @@ function startSheetSync() {
     SHEET_WEBHOOK_URL: '',
   });
   sheetSync.on('exit', (code, signal) => {
-    if (stopping) {
-      console.log(`[runner sheet-sync] stopped code=${code ?? ''} signal=${signal || ''}`);
-      return;
-    }
+    if (stopping) return console.log(`[runner sheet-sync] stopped code=${code ?? ''} signal=${signal || ''}`);
     console.error(`[runner sheet-sync] exited code=${code} signal=${signal || ''}`);
     try { recordOpsEvent({ level:'ERROR', component:'sheet-sync', event:'unexpected_exit', details:{ code, signal } }); } catch {}
     setTimeout(startSheetSync, 5000).unref();
@@ -128,7 +119,9 @@ async function refreshRuntimeStatus() {
       version: VERSION,
       workers: workerStatus(),
       sheetSync: {
-        configured: Boolean(RESULT_SHEET_WEBHOOK_URL && UPSTREAM_SHEET_SECRET),
+        mode: RESULT_EXPORT_TOKEN ? 'pull-csv' : (RESULT_SHEET_WEBHOOK_URL ? 'webhook' : 'disabled'),
+        pullConfigured: Boolean(RESULT_EXPORT_TOKEN),
+        webhookConfigured: Boolean(RESULT_SHEET_WEBHOOK_URL && UPSTREAM_SHEET_SECRET),
         intervalMs: Number(process.env.SHEET_SYNC_INTERVAL_MS || 300000),
       },
       config: {
@@ -148,9 +141,7 @@ async function refreshRuntimeStatus() {
 
 async function scannerCoreHealth() {
   try {
-    const res = await fetch(`http://127.0.0.1:${SCANNER_INTERNAL_PORT}/health`, {
-      signal: AbortSignal.timeout(1200),
-    });
+    const res = await fetch(`http://127.0.0.1:${SCANNER_INTERNAL_PORT}/health`, { signal: AbortSignal.timeout(1200) });
     if (!res.ok) return { ok:false, status:res.status };
     return await res.json();
   } catch (err) {
@@ -164,9 +155,7 @@ async function compositeHealth() {
   const core = await scannerCoreHealth();
   const ageMs = runtime?.generatedAt ? Date.now() - new Date(runtime.generatedAt).getTime() : Infinity;
   const workers = runtime?.workers || workerStatus();
-  const healthy = Boolean(
-    core?.ok && ageMs < 60000 && workers.scanner && workers.jobWorker && workers.canaryMarketTracker
-  );
+  const healthy = Boolean(core?.ok && ageMs < 60000 && workers.scanner && workers.jobWorker && workers.canaryMarketTracker);
   return {
     ok: healthy,
     service: 'scanner-monitor',
@@ -179,38 +168,75 @@ async function compositeHealth() {
   };
 }
 
+function cachedSheetPayload() {
+  if (exportCache.payload && Date.now() - exportCache.at < 30_000) return exportCache.payload;
+  const payload = buildSheetPayload();
+  exportCache = { at: Date.now(), payload };
+  return payload;
+}
+
+function exportRows(pathname) {
+  const payload = cachedSheetPayload();
+  if (pathname === '/export/discovery.csv') return payload.sheets['新币发现'];
+  if (pathname === '/export/canary.csv') return payload.sheets['Canary跟踪'];
+  if (pathname === '/export/stages.csv') return payload.sheets['阶段升级记录'];
+  return null;
+}
+
 function startHealthServer() {
   healthServer = http.createServer(async (req, res) => {
-    if (req.url === '/health') {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    if (url.pathname === '/health') {
       const body = await compositeHealth();
-      res.writeHead(body.ok ? 200 : 503, { 'content-type':'application/json' });
+      res.writeHead(body.ok ? 200 : 503, { 'content-type':'application/json', 'cache-control':'no-store' });
       res.end(JSON.stringify(body));
       return;
     }
+
+    if (url.pathname.startsWith('/export/')) {
+      if (!RESULT_EXPORT_TOKEN || url.searchParams.get('token') !== RESULT_EXPORT_TOKEN) {
+        res.writeHead(401, { 'content-type':'text/plain; charset=utf-8', 'cache-control':'no-store' });
+        res.end('unauthorized\n');
+        return;
+      }
+      try {
+        const rows = exportRows(url.pathname);
+        if (!rows) {
+          res.writeHead(404, { 'content-type':'text/plain; charset=utf-8' });
+          res.end('not_found\n');
+          return;
+        }
+        const csv = rowsToCsv(rows);
+        res.writeHead(200, {
+          'content-type':'text/csv; charset=utf-8',
+          'cache-control':'no-store, max-age=0',
+          'x-rh-result-version': VERSION,
+        });
+        res.end(csv);
+        console.log('[result export]', JSON.stringify({ path:url.pathname, rows:rows.length, bytes:Buffer.byteLength(csv) }));
+        return;
+      } catch (err) {
+        console.error('[result export]', err?.message || err);
+        res.writeHead(500, { 'content-type':'text/plain; charset=utf-8', 'cache-control':'no-store' });
+        res.end('export_error\n');
+        return;
+      }
+    }
+
     res.writeHead(404, { 'content-type':'application/json' });
     res.end(JSON.stringify({ ok:false, error:'not_found' }));
   });
-  healthServer.listen(HEALTH_PORT, '0.0.0.0', () => {
-    console.log(`[runner health] listening on :${HEALTH_PORT}`);
-  });
+  healthServer.listen(HEALTH_PORT, '0.0.0.0', () => console.log(`[runner health] listening on :${HEALTH_PORT}`));
 }
 
 async function probeVolume() {
   const now = new Date().toISOString();
   let previous = null;
-  try {
-    previous = JSON.parse(await readFile(VOLUME_PROBE_PATH, 'utf8'));
-  } catch (err) {
-    if (err?.code !== 'ENOENT') console.warn('[volume probe] read failed', err?.message || err);
-  }
+  try { previous = JSON.parse(await readFile(VOLUME_PROBE_PATH, 'utf8')); }
+  catch (err) { if (err?.code !== 'ENOENT') console.warn('[volume probe] read failed', err?.message || err); }
 
   const boots = Number(previous?.boots || 0) + 1;
-  const record = {
-    firstSeen: previous?.firstSeen || now,
-    lastSeen: now,
-    boots,
-    service: 'scanner-monitor',
-  };
+  const record = { firstSeen: previous?.firstSeen || now, lastSeen: now, boots, service: 'scanner-monitor' };
   await writeFile(VOLUME_PROBE_PATH, JSON.stringify(record, null, 2) + '\n', 'utf8');
   console.log('[volume probe]', JSON.stringify({
     path: VOLUME_PROBE_PATH,
@@ -229,13 +255,10 @@ async function main() {
 
   initializeDeadLetterStore();
   console.log('[dead letter boot]', JSON.stringify(getDeadLetterStats()));
-
   ensurePriceMilestoneSchema();
   console.log('[price milestones boot]', JSON.stringify(getPriceMilestoneHealth()));
-
   ensureAthSchema();
   console.log('[ath boot]', JSON.stringify(getAthHealth()));
-
   ensureOpsSchema();
   recordOpsEvent({ level:'INFO', component:'runner', event:'boot', message:`scanner-monitor ${VERSION}`, details:dbStatus });
 
@@ -257,6 +280,7 @@ async function main() {
     athTracking: true,
     opsEvents: true,
     runtimeHealth: true,
+    resultPullCsv: Boolean(RESULT_EXPORT_TOKEN),
     legacyEnricher: LEGACY_ENRICHER,
     persistenceProxy: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
     rawSheetUpstreamConfigured: Boolean(UPSTREAM_SHEET_WEBHOOK_URL),
@@ -281,10 +305,7 @@ async function main() {
   runtimeTimer.unref();
 
   scanner.on('exit', (code, signal) => {
-    if (stopping) {
-      console.log(`[runner scanner] stopped code=${code ?? ''} signal=${signal || ''}`);
-      return;
-    }
+    if (stopping) return console.log(`[runner scanner] stopped code=${code ?? ''} signal=${signal || ''}`);
     console.error(`[runner scanner] exited unexpectedly code=${code} signal=${signal || ''}`);
     try { recordOpsEvent({ level:'ERROR', component:'scanner', event:'unexpected_exit', details:{ code, signal } }); } catch {}
     stopping = true;
