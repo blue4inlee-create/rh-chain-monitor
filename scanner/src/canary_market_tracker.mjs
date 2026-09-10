@@ -10,6 +10,7 @@ import { ensurePriceMilestoneSchema } from './price_milestones.mjs';
 import { ensureAthSchema, recordMarketTick, getAthHealth } from './ath_metrics.mjs';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
+const VERSION = '2.15.0-shadow';
 const CFG = {
   chainId: 4663,
   rpc: process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com',
@@ -20,6 +21,12 @@ const CFG = {
   minIntervalMs: Math.max(60_000, Number(process.env.CANARY_TRACK_INTERVAL_MS || 300_000)),
   batchSize: Math.max(1, Math.min(20, Number(process.env.CANARY_TRACK_BATCH || 4))),
   rpcGapMs: Math.max(150, Number(process.env.CANARY_TRACK_RPC_GAP_MS || 300)),
+  shadowEnabled: !/^(0|false|no)$/i.test(String(process.env.SHADOW_TRACK_ENABLED || 'true')),
+  shadowMinScore: Math.max(0, Number(process.env.SHADOW_TRACK_MIN_SCORE || 45)),
+  shadowMinAgeMs: Math.max(60_000, Number(process.env.SHADOW_TRACK_MIN_AGE_MS || 120_000)),
+  shadowMaxAgeMs: Math.max(5 * 60_000, Number(process.env.SHADOW_TRACK_MAX_AGE_MS || 30 * 60_000)),
+  shadowIntervalMs: Math.max(60_000, Number(process.env.SHADOW_TRACK_INTERVAL_MS || 300_000)),
+  shadowBatchSize: Math.max(1, Math.min(10, Number(process.env.SHADOW_TRACK_BATCH || 2))),
 };
 
 const client = createPublicClient({
@@ -84,7 +91,7 @@ async function readContract(address, abi, functionName, args = []) {
 async function fetchJson(url, timeoutMs = 7000) {
   try {
     const res = await fetch(url, {
-      headers: { accept: 'application/json', 'user-agent': 'rh-canary-market-tracker/2.13.0' },
+      headers: { accept: 'application/json', 'user-agent': `rh-canary-market-tracker/${VERSION}` },
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) return { ok: false, status: res.status, data: null };
@@ -195,7 +202,8 @@ function dueCanaries() {
     SELECT t.token_address, t.decimals, t.total_supply, t.first_pool_key, t.canary_at,
            MAX(m.tick_at) AS last_tick_at
     FROM tokens t
-    LEFT JOIN market_ticks m ON m.token_address=t.token_address
+    LEFT JOIN market_ticks m
+      ON m.token_address=t.token_address AND m.tick_at >= t.canary_at
     WHERE t.monitor_stage IN ('CANARY','EARLY_ALPHA','CONFIRMED_ALPHA','SIZE_UP')
     GROUP BY t.token_address
     HAVING last_tick_at IS NULL OR last_tick_at <= ?
@@ -207,12 +215,52 @@ function dueCanaries() {
   `).all(cutoff, CFG.batchSize);
 }
 
-async function cycle() {
-  for (const row of dueCanaries()) {
+function dueShadows() {
+  if (!CFG.shadowEnabled) return [];
+  const db = getDatabase();
+  const now = Date.now();
+  const oldest = new Date(now - CFG.shadowMaxAgeMs).toISOString();
+  const newest = new Date(now - CFG.shadowMinAgeMs).toISOString();
+  const cutoff = new Date(now - CFG.shadowIntervalMs).toISOString();
+  return db.prepare(`
+    SELECT t.token_address, t.decimals, t.total_supply, t.first_pool_key, t.first_seen_at,
+           (
+             SELECT s.final_score
+             FROM scores s
+             WHERE s.token_address=t.token_address
+             ORDER BY s.scored_at DESC, s.id DESC
+             LIMIT 1
+           ) AS latest_score,
+           MAX(m.tick_at) AS last_tick_at
+    FROM tokens t
+    LEFT JOIN market_ticks m ON m.token_address=t.token_address
+    WHERE t.monitor_stage='DISCOVERY'
+      AND t.first_seen_at >= ?
+      AND t.first_seen_at <= ?
+      AND COALESCE((
+        SELECT s.final_score
+        FROM scores s
+        WHERE s.token_address=t.token_address
+        ORDER BY s.scored_at DESC, s.id DESC
+        LIMIT 1
+      ), 0) >= ?
+    GROUP BY t.token_address
+    HAVING last_tick_at IS NULL OR last_tick_at <= ?
+    ORDER BY
+      CASE WHEN last_tick_at IS NULL THEN 0 ELSE 1 END ASC,
+      latest_score DESC,
+      CASE WHEN last_tick_at IS NULL THEN t.first_seen_at END DESC,
+      last_tick_at ASC
+    LIMIT ?
+  `).all(oldest, newest, CFG.shadowMinScore, cutoff, CFG.shadowBatchSize);
+}
+
+async function trackRows(rows, label) {
+  for (const row of rows) {
     if (stopping) return;
     const metrics = await marketMetrics(row);
     if (!metrics) {
-      console.log('[canary tick pending]', JSON.stringify({ token: row.token_address }));
+      console.log(`[${label} tick pending]`, JSON.stringify({ token: row.token_address, score: row.latest_score ?? null }));
       continue;
     }
     const result = recordMarketTick({
@@ -220,10 +268,11 @@ async function cycle() {
       poolKey: metrics.poolKey,
       tickAt: new Date().toISOString(),
       ...metrics,
-      raw: metrics.raw,
+      raw: { ...metrics.raw, trackingMode: label, scoreAtSelection: row.latest_score ?? null },
     });
-    console.log('[canary tick]', JSON.stringify({
+    console.log(`[${label} tick]`, JSON.stringify({
       token: row.token_address,
+      score: row.latest_score ?? null,
       price: metrics.priceUsd,
       marketCap: metrics.marketCap,
       liquidity: metrics.liquidityUsd,
@@ -235,17 +284,30 @@ async function cycle() {
   }
 }
 
+async function cycle() {
+  await trackRows(dueCanaries(), 'canary');
+  if (!stopping) await trackRows(dueShadows(), 'shadow');
+}
+
 async function main() {
   initializeDatabase();
   ensurePriceMilestoneSchema();
   ensureAthSchema();
   console.log('[canary tracker boot]', JSON.stringify({
-    version: '2.13.0',
-    priority: 'new-untracked-first',
+    version: VERSION,
+    priority: 'new-canary-first-then-near-miss-shadow',
     cycleMs: CFG.cycleMs,
     minIntervalMs: CFG.minIntervalMs,
     batchSize: CFG.batchSize,
     rpcGapMs: CFG.rpcGapMs,
+    shadow: {
+      enabled: CFG.shadowEnabled,
+      minScore: CFG.shadowMinScore,
+      minAgeMs: CFG.shadowMinAgeMs,
+      maxAgeMs: CFG.shadowMaxAgeMs,
+      intervalMs: CFG.shadowIntervalMs,
+      batchSize: CFG.shadowBatchSize,
+    },
     ...getAthHealth(),
   }));
   while (!stopping) {
