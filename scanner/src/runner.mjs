@@ -3,6 +3,7 @@ import { rm, readFile, writeFile } from 'node:fs/promises';
 import { initializeDatabase, closeDatabase } from './db.mjs';
 import { initializeDeadLetterStore, getDeadLetterStats } from './dead_letter.mjs';
 import { ensurePriceMilestoneSchema, getPriceMilestoneHealth } from './price_milestones.mjs';
+import { ensureAthSchema, getAthHealth } from './ath_metrics.mjs';
 import { startPersistenceProxy } from './persistence_proxy.mjs';
 
 const ROOT = new URL('.', import.meta.url);
@@ -17,6 +18,7 @@ const LEGACY_ENRICHER = /^(1|true|yes)$/i.test(String(process.env.LEGACY_ENRICHE
 let stopping = false;
 let enricher = null;
 let jobWorker = null;
+let marketTracker = null;
 let persistenceProxy = null;
 
 function spawnNode(file, label, extraEnv = {}) {
@@ -60,6 +62,19 @@ function startJobWorker() {
   });
 }
 
+function startMarketTracker() {
+  if (stopping) return;
+  marketTracker = spawnNode('canary_market_tracker.mjs', 'canary-market-tracker');
+  marketTracker.on('exit', (code, signal) => {
+    if (stopping) {
+      console.log(`[runner canary-market-tracker] stopped code=${code ?? ''} signal=${signal || ''}`);
+      return;
+    }
+    console.error(`[runner canary-market-tracker] exited code=${code} signal=${signal || ''}`);
+    setTimeout(startMarketTracker, 5000).unref();
+  });
+}
+
 async function probeVolume() {
   const now = new Date().toISOString();
   let previous = null;
@@ -98,6 +113,9 @@ async function main() {
   ensurePriceMilestoneSchema();
   console.log('[price milestones boot]', JSON.stringify(getPriceMilestoneHealth()));
 
+  ensureAthSchema();
+  console.log('[ath boot]', JSON.stringify(getAthHealth()));
+
   persistenceProxy = await startPersistenceProxy({
     port: PERSIST_PROXY_PORT,
     upstreamUrl: UPSTREAM_SHEET_WEBHOOK_URL,
@@ -107,12 +125,13 @@ async function main() {
 
   await Promise.all([rm(QUEUE_PATH, { force: true }), rm(OFFSET_PATH, { force: true })]);
   console.log('[runner] starting scanner + workers', JSON.stringify({
-    version: '2.11.0',
+    version: '2.12.0',
     sqliteFirst: true,
     sqliteJobs: true,
     persistentCursor: true,
     deadLetters: true,
     priceMilestones: true,
+    athTracking: true,
     legacyEnricher: LEGACY_ENRICHER,
     persistenceProxy: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
     upstreamSheetConfigured: Boolean(UPSTREAM_SHEET_WEBHOOK_URL),
@@ -120,6 +139,7 @@ async function main() {
 
   startEnricher();
   startJobWorker();
+  startMarketTracker();
   const scanner = spawnNode('rh_newcoin_scanner.mjs', 'scanner', {
     SHEET_WEBHOOK_URL: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
     SHEET_INGEST_SECRET: LOCAL_PERSIST_SECRET,
@@ -134,6 +154,7 @@ async function main() {
     stopping = true;
     if (enricher && !enricher.killed) enricher.kill('SIGTERM');
     if (jobWorker && !jobWorker.killed) jobWorker.kill('SIGTERM');
+    if (marketTracker && !marketTracker.killed) marketTracker.kill('SIGTERM');
     if (persistenceProxy) persistenceProxy.close();
     closeDatabase();
     process.exitCode = code && code > 0 ? code : 1;
@@ -146,6 +167,7 @@ async function main() {
     if (scanner && !scanner.killed) scanner.kill(signal);
     if (enricher && !enricher.killed) enricher.kill(signal);
     if (jobWorker && !jobWorker.killed) jobWorker.kill(signal);
+    if (marketTracker && !marketTracker.killed) marketTracker.kill(signal);
     if (persistenceProxy) persistenceProxy.close();
     closeDatabase();
     setTimeout(() => process.exit(0), 1500).unref();
