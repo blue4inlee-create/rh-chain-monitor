@@ -11,6 +11,7 @@ const PERSIST_PROXY_PORT = Number(process.env.PERSIST_PROXY_PORT || 3101);
 const UPSTREAM_SHEET_WEBHOOK_URL = String(process.env.SHEET_WEBHOOK_URL || '').trim();
 const UPSTREAM_SHEET_SECRET = String(process.env.SHEET_INGEST_SECRET || '').trim();
 const LOCAL_PERSIST_SECRET = 'sqlite-local-ingest';
+const LEGACY_ENRICHER = /^(1|true|yes)$/i.test(String(process.env.LEGACY_ENRICHER_ENABLED || 'false'));
 let stopping = false;
 let enricher = null;
 let jobWorker = null;
@@ -23,6 +24,7 @@ function spawnNode(file, label, extraEnv = {}) {
       ...process.env,
       ENRICH_QUEUE_PATH: QUEUE_PATH,
       ENRICH_OFFSET_PATH: OFFSET_PATH,
+      LEGACY_ENRICHER_ENABLED: LEGACY_ENRICHER ? 'true' : 'false',
       ...extraEnv,
     },
   });
@@ -31,7 +33,7 @@ function spawnNode(file, label, extraEnv = {}) {
 }
 
 function startEnricher() {
-  if (stopping) return;
+  if (stopping || !LEGACY_ENRICHER) return;
   enricher = spawnNode('enricher.mjs', 'enricher');
   enricher.on('exit', (code, signal) => {
     console.error(`[runner enricher] exited code=${code} signal=${signal || ''}`);
@@ -89,10 +91,11 @@ async function main() {
 
   await Promise.all([rm(QUEUE_PATH, { force: true }), rm(OFFSET_PATH, { force: true })]);
   console.log('[runner] starting scanner + workers', JSON.stringify({
-    version: '2.5.0',
-    queue: QUEUE_PATH,
+    version: '2.9.0',
     sqliteFirst: true,
     sqliteJobs: true,
+    persistentCursor: true,
+    legacyEnricher: LEGACY_ENRICHER,
     persistenceProxy: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
     upstreamSheetConfigured: Boolean(UPSTREAM_SHEET_WEBHOOK_URL),
   }));
