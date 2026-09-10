@@ -13,6 +13,7 @@ const UPSTREAM_SHEET_SECRET = String(process.env.SHEET_INGEST_SECRET || '').trim
 const LOCAL_PERSIST_SECRET = 'sqlite-local-ingest';
 let stopping = false;
 let enricher = null;
+let jobWorker = null;
 let persistenceProxy = null;
 
 function spawnNode(file, label, extraEnv = {}) {
@@ -35,6 +36,15 @@ function startEnricher() {
   enricher.on('exit', (code, signal) => {
     console.error(`[runner enricher] exited code=${code} signal=${signal || ''}`);
     if (!stopping) setTimeout(startEnricher, 5000).unref();
+  });
+}
+
+function startJobWorker() {
+  if (stopping) return;
+  jobWorker = spawnNode('job_worker.mjs', 'job-worker');
+  jobWorker.on('exit', (code, signal) => {
+    console.error(`[runner job-worker] exited code=${code} signal=${signal || ''}`);
+    if (!stopping) setTimeout(startJobWorker, 5000).unref();
   });
 }
 
@@ -78,15 +88,17 @@ async function main() {
   });
 
   await Promise.all([rm(QUEUE_PATH, { force: true }), rm(OFFSET_PATH, { force: true })]);
-  console.log('[runner] starting scanner + queue enricher', JSON.stringify({
-    version: '2.4.1',
+  console.log('[runner] starting scanner + workers', JSON.stringify({
+    version: '2.5.0',
     queue: QUEUE_PATH,
     sqliteFirst: true,
+    sqliteJobs: true,
     persistenceProxy: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
     upstreamSheetConfigured: Boolean(UPSTREAM_SHEET_WEBHOOK_URL),
   }));
 
   startEnricher();
+  startJobWorker();
   const scanner = spawnNode('rh_newcoin_scanner.mjs', 'scanner', {
     SHEET_WEBHOOK_URL: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
     SHEET_INGEST_SECRET: LOCAL_PERSIST_SECRET,
@@ -96,6 +108,7 @@ async function main() {
     console.error(`[runner scanner] exited code=${code} signal=${signal || ''}`);
     stopping = true;
     if (enricher && !enricher.killed) enricher.kill('SIGTERM');
+    if (jobWorker && !jobWorker.killed) jobWorker.kill('SIGTERM');
     if (persistenceProxy) persistenceProxy.close();
     closeDatabase();
     process.exitCode = code ?? 1;
@@ -107,6 +120,7 @@ async function main() {
     console.log(`[runner] ${signal}; shutting down children`);
     if (scanner && !scanner.killed) scanner.kill(signal);
     if (enricher && !enricher.killed) enricher.kill(signal);
+    if (jobWorker && !jobWorker.killed) jobWorker.kill(signal);
     if (persistenceProxy) persistenceProxy.close();
     closeDatabase();
     setTimeout(() => process.exit(0), 8000).unref();
