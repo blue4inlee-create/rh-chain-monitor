@@ -4,6 +4,7 @@ import {
   createPublicClient, http as viemHttp, parseAbiItem, decodeEventLog,
   decodeAbiParameters, getAddress,
 } from 'viem';
+import { loadScannerCursor, saveScannerCursor } from './scanner_state.mjs';
 
 const CFG = {
   chainId: 4663,
@@ -11,11 +12,14 @@ const CFG = {
   pollMs: Number(process.env.POLL_MS || 5000),
   heartbeatMs: Number(process.env.HEARTBEAT_MS || 120000),
   backfillBlocks: Number(process.env.BACKFILL_BLOCKS || 120),
+  reorgBlocks: Math.max(0, Number(process.env.CURSOR_REORG_BLOCKS || 3)),
+  scannerName: String(process.env.SCANNER_NAME || 'combined-main'),
   port: Number(process.env.PORT || 3000),
   dryRun: String(process.env.DRY_RUN || '').toLowerCase() === 'true',
   webhookUrl: String(process.env.SHEET_WEBHOOK_URL || '').trim(),
   webhookSecret: String(process.env.SHEET_INGEST_SECRET || '').trim(),
   enrichQueuePath: String(process.env.ENRICH_QUEUE_PATH || '/tmp/rh_enrich_queue.jsonl'),
+  legacyEnricher: /^(1|true|yes)$/i.test(String(process.env.LEGACY_ENRICHER_ENABLED || 'false')),
   ponsV2Factory: norm(process.env.PONS_V2_FACTORY || '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e'),
   v4PoolManager: norm(process.env.UNIV4_POOL_MANAGER || '0x8366a39cc670b4001a1121b8f6a443a643e40951'),
   v3Factory: norm(process.env.UNIV3_FACTORY || ''),
@@ -41,7 +45,7 @@ const client = createPublicClient({
 const state = {
   startedAt:new Date().toISOString(),lastBlock:null,lastPollAt:null,lastHeartbeatAt:null,
   lastEventAt:null,eventsSeen:0,webhookOk:0,webhookFail:0,queueWrites:0,queueErrors:0,
-  rawOutbox:0,lastError:null,
+  rawOutbox:0,lastError:null,cursorSource:null,cursorSavedAt:null,
 };
 const seen = new Map(), rawOutbox = [];
 let rawWebhookActive = 0, queueWriteTail = Promise.resolve();
@@ -88,6 +92,7 @@ function enqueueRawWebhook(p){
   rawOutbox.push(p);state.rawOutbox=rawOutbox.length;pumpRawWebhooks();
 }
 function appendEnrichmentQueue(p){
+  if(!CFG.legacyEnricher)return Promise.resolve();
   const item={source:p.source||'Robinhood Chain',firstSeen:p.firstSeen||new Date().toISOString(),
     lastUpdate:p.lastUpdate||new Date().toISOString(),stage:p.stage||'',tokenCa:p.tokenCa||'',
     pool:p.pool||'',deployer:p.deployer||'',pairToken:p.pairToken||'',pairType:p.pairType||'',
@@ -173,12 +178,23 @@ function heartbeat(){
 
 async function mainLoop(){
   let latest=await client.getBlockNumber();
-  let cursor=latest>BigInt(CFG.backfillBlocks)?latest-BigInt(CFG.backfillBlocks):0n;
+  const saved=loadScannerCursor(CFG.scannerName);
+  let cursor;
+  if(saved?.lastBlock>0&&BigInt(saved.lastBlock)<=latest){
+    const reorg=BigInt(CFG.reorgBlocks);
+    cursor=BigInt(saved.lastBlock)>reorg?BigInt(saved.lastBlock)-reorg:0n;
+    state.cursorSource='sqlite';
+    saveScannerCursor(CFG.scannerName,saved.lastBlock,Number(latest),{resumed:true});
+  }else{
+    cursor=latest>BigInt(CFG.backfillBlocks)?latest-BigInt(CFG.backfillBlocks):0n;
+    state.cursorSource='startup-backfill';
+  }
   state.lastBlock=Number(cursor);
-  console.log('[boot]',JSON.stringify({version:'2.2.1',scanMode:'combined-log-filter',chainId:CFG.chainId,
-    rpc:CFG.rpcUrl,pollMs:CFG.pollMs,backfillBlocks:CFG.backfillBlocks,
+  console.log('[boot]',JSON.stringify({version:'2.3.0',scanMode:'combined-log-filter',chainId:CFG.chainId,
+    rpc:CFG.rpcUrl,pollMs:CFG.pollMs,backfillBlocks:CFG.backfillBlocks,reorgBlocks:CFG.reorgBlocks,
+    cursorSource:state.cursorSource,savedCursor:saved?.lastBlock||null,startCursor:Number(cursor),
     webhookConfigured:Boolean(CFG.webhookUrl&&CFG.webhookSecret),dryRun:CFG.dryRun,
-    enrichQueue:CFG.enrichQueuePath,ponsV2Factory:CFG.ponsV2Factory,v4PoolManager:CFG.v4PoolManager,
+    legacyEnricher:CFG.legacyEnricher,ponsV2Factory:CFG.ponsV2Factory,v4PoolManager:CFG.v4PoolManager,
     v3Factory:CFG.v3Factory||null,quoteTokens:[...QUOTES]}));
   while(true){
     try{
@@ -188,10 +204,17 @@ async function mainLoop(){
         while(from<=latest){
           const to=from+1999n<latest?from+1999n:latest;
           await scanRange(from,to);cursor=to;state.lastBlock=Number(cursor);from=to+1n;
+          try{
+            const c=saveScannerCursor(CFG.scannerName,Number(cursor),Number(latest));
+            state.cursorSavedAt=c?.updatedAt||new Date().toISOString();
+          }catch(e){
+            state.lastError=`cursor: ${String(e?.message||e)}`;
+            console.error('[cursor]',state.lastError);
+          }
         }
       }
     }catch(e){state.lastError=String(e?.message||e);console.error('[poll]',state.lastError);
-      if(state.lastError.includes('429'))await new Promise(r=>setTimeout(r,5000))}
+      if(state.lastError.includes('429')||/rate limit/i.test(state.lastError))await new Promise(r=>setTimeout(r,5000))}
     await new Promise(r=>setTimeout(r,CFG.pollMs));
   }
 }
@@ -199,7 +222,8 @@ async function mainLoop(){
 const server=http.createServer((req,res)=>{
   if(req.url==='/health'){
     res.writeHead(200,{'content-type':'application/json'});
-    res.end(JSON.stringify({ok:true,service:'rh-newcoin-scanner',version:'2.2.1',...state,
+    res.end(JSON.stringify({ok:true,service:'rh-newcoin-scanner',version:'2.3.0',...state,
+      scannerName:CFG.scannerName,legacyEnricher:CFG.legacyEnricher,
       webhookConfigured:Boolean(CFG.webhookUrl&&CFG.webhookSecret),dryRun:CFG.dryRun}));return;
   }
   res.writeHead(404,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,error:'not_found'}));
