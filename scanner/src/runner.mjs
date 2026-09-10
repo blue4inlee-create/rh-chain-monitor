@@ -9,7 +9,7 @@ import { startPersistenceProxy } from './persistence_proxy.mjs';
 import { ensureOpsSchema, recordOpsEvent, writeRuntimeStatus, STATUS_PATH } from './ops_status.mjs';
 import { buildSheetPayload, rowsToCsv } from './sheet_data.mjs';
 
-const VERSION = '2.14.0';
+const VERSION = '2.14.1';
 const ROOT = new URL('.', import.meta.url);
 const QUEUE_PATH = process.env.ENRICH_QUEUE_PATH || '/tmp/rh_enrich_queue.jsonl';
 const OFFSET_PATH = process.env.ENRICH_OFFSET_PATH || '/tmp/rh_enrich_queue.offset';
@@ -180,6 +180,7 @@ function exportRows(pathname) {
   if (pathname === '/export/discovery.csv') return payload.sheets['新币发现'];
   if (pathname === '/export/canary.csv') return payload.sheets['Canary跟踪'];
   if (pathname === '/export/stages.csv') return payload.sheets['阶段升级记录'];
+  if (pathname === '/export/lifecycle.csv') return payload.sheets['生命周期'];
   return null;
 }
 
