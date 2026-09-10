@@ -14,6 +14,7 @@ import {
   updateTokenEnrichment,
   getDatabaseHealth,
 } from './db.mjs';
+import { saveRiskChecks } from './risk.mjs';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 const CFG = {
@@ -79,7 +80,7 @@ async function fetchJson(url, timeoutMs = 7000, headers = {}) {
     const res = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'rh-chain-monitor-job-worker/2.5.1',
+        'user-agent': 'rh-chain-monitor-job-worker/2.6',
         ...headers,
       },
       signal: AbortSignal.timeout(timeoutMs),
@@ -262,6 +263,7 @@ async function enrichJob(job) {
     pair ? 'DEX_OK' : (dex.ok ? 'DEX_PENDING' : `DEX_${dex.status || 'ERR'}`),
     pons.isPons ? (pons.priceUsd != null ? 'PONS_CURVE_OK' : `PONS_PHASE_${pons.phase}`) : 'DIRECT_POOL',
   ];
+  const sourceStatus = sources.join('|');
 
   updateTokenEnrichment(token, meta);
   const snapshot = saveSnapshot(job, {
@@ -277,7 +279,7 @@ async function enrichJob(job) {
     holderCount: holderCount(blockscout.holders.data),
     dex: text(pair?.dexId) || (pons.isPons ? 'pons-curve' : ''),
     pairAddress: text(pair?.pairAddress) || pons.curve || text(payload.pool || job.pool_key),
-    sourceStatus: sources.join('|'),
+    sourceStatus,
     raw: {
       metricWindow: 'dexscreener_m5_at_snapshot_time',
       payload,
@@ -287,6 +289,14 @@ async function enrichJob(job) {
       blockscoutCounters: blockscout.holders.data,
       dexPair: pair,
     },
+  });
+
+  const risk = saveRiskChecks({
+    snapshot,
+    chainMeta,
+    pons,
+    pairToken: pons.pairToken || payload.pairToken || '',
+    sourceStatus,
   });
 
   completeJob(job.job_id);
@@ -302,6 +312,7 @@ async function enrichJob(job) {
     sells: snapshot.sell_count,
     holders: snapshot.holder_count,
     priceChangePct: snapshot.price_change_pct,
+    risk: risk.counts,
     status: snapshot.source_status,
   };
 }
@@ -309,7 +320,7 @@ async function enrichJob(job) {
 async function main() {
   const db = initializeDatabase();
   console.log('[job worker boot]', JSON.stringify({
-    version: '2.5.1',
+    version: '2.6.0',
     pollMs: CFG.pollMs,
     blockscoutKeyConfigured: Boolean(CFG.blockscoutKey),
     ...db,
