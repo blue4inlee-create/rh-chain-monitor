@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { persistDiscoveryEvent, getDatabaseHealth } from './db.mjs';
+import { persistLifecycleMilestone, getLifecycleMilestoneHealth } from './lifecycle_milestones.mjs';
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -54,7 +55,12 @@ export async function startPersistenceProxy({
     if (req.method === 'GET' && req.url === '/health') {
       try {
         res.writeHead(200, { 'content-type': 'application/json' });
-        return res.end(JSON.stringify({ ok: true, service: 'persistence-proxy', ...getDatabaseHealth() }));
+        return res.end(JSON.stringify({
+          ok: true,
+          service: 'persistence-proxy',
+          ...getDatabaseHealth(),
+          lifecycle: getLifecycleMilestoneHealth(),
+        }));
       } catch (err) {
         res.writeHead(500, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: String(err?.message || err) }));
@@ -73,6 +79,12 @@ export async function startPersistenceProxy({
         return res.end(JSON.stringify({ ok: false, error: 'bad_secret' }));
       }
 
+      let lifecycleResult = { ok: true, skipped: true };
+      if (payload?.tokenCa || payload?.token_address) {
+        lifecycleResult = persistLifecycleMilestone(payload);
+        if (!lifecycleResult?.ok && !lifecycleResult?.skipped) throw new Error('lifecycle_persist_failed');
+      }
+
       let dbResult = { ok: true, skipped: true };
       if (isDiscoveryPayload(payload)) {
         dbResult = persistDiscoveryEvent(payload);
@@ -87,7 +99,7 @@ export async function startPersistenceProxy({
 
       const upstream = await forward(upstreamUrl, upstreamSecret, payload);
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, db: dbResult, upstream }));
+      res.end(JSON.stringify({ ok: true, db: dbResult, lifecycle: lifecycleResult, upstream }));
     } catch (err) {
       console.error('[persistence proxy]', String(err?.message || err));
       res.writeHead(502, { 'content-type': 'application/json' });
@@ -104,6 +116,7 @@ export async function startPersistenceProxy({
     address: `http://127.0.0.1:${port}/ingest`,
     upstreamConfigured: Boolean(upstreamUrl),
     ...getDatabaseHealth(),
+    lifecycle: getLifecycleMilestoneHealth(),
   }));
   return server;
 }
