@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { rm, readFile, writeFile } from 'node:fs/promises';
 import { initializeDatabase, closeDatabase } from './db.mjs';
 import { initializeDeadLetterStore, getDeadLetterStats } from './dead_letter.mjs';
+import { ensurePriceMilestoneSchema, getPriceMilestoneHealth } from './price_milestones.mjs';
 import { startPersistenceProxy } from './persistence_proxy.mjs';
 
 const ROOT = new URL('.', import.meta.url);
@@ -94,6 +95,9 @@ async function main() {
   initializeDeadLetterStore();
   console.log('[dead letter boot]', JSON.stringify(getDeadLetterStats()));
 
+  ensurePriceMilestoneSchema();
+  console.log('[price milestones boot]', JSON.stringify(getPriceMilestoneHealth()));
+
   persistenceProxy = await startPersistenceProxy({
     port: PERSIST_PROXY_PORT,
     upstreamUrl: UPSTREAM_SHEET_WEBHOOK_URL,
@@ -103,11 +107,12 @@ async function main() {
 
   await Promise.all([rm(QUEUE_PATH, { force: true }), rm(OFFSET_PATH, { force: true })]);
   console.log('[runner] starting scanner + workers', JSON.stringify({
-    version: '2.10.0',
+    version: '2.11.0',
     sqliteFirst: true,
     sqliteJobs: true,
     persistentCursor: true,
     deadLetters: true,
+    priceMilestones: true,
     legacyEnricher: LEGACY_ENRICHER,
     persistenceProxy: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
     upstreamSheetConfigured: Boolean(UPSTREAM_SHEET_WEBHOOK_URL),
