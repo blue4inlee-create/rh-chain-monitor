@@ -9,6 +9,8 @@ const OFFSET_PATH = process.env.ENRICH_OFFSET_PATH || '/tmp/rh_enrich_queue.offs
 const VOLUME_PROBE_PATH = process.env.VOLUME_PROBE_PATH || '/data/volume_probe.json';
 const PERSIST_PROXY_PORT = Number(process.env.PERSIST_PROXY_PORT || 3101);
 const UPSTREAM_SHEET_WEBHOOK_URL = String(process.env.SHEET_WEBHOOK_URL || '').trim();
+const UPSTREAM_SHEET_SECRET = String(process.env.SHEET_INGEST_SECRET || '').trim();
+const LOCAL_PERSIST_SECRET = 'sqlite-local-ingest';
 let stopping = false;
 let enricher = null;
 let persistenceProxy = null;
@@ -71,12 +73,13 @@ async function main() {
   persistenceProxy = await startPersistenceProxy({
     port: PERSIST_PROXY_PORT,
     upstreamUrl: UPSTREAM_SHEET_WEBHOOK_URL,
-    secret: String(process.env.SHEET_INGEST_SECRET || '').trim(),
+    localSecret: LOCAL_PERSIST_SECRET,
+    upstreamSecret: UPSTREAM_SHEET_SECRET,
   });
 
   await Promise.all([rm(QUEUE_PATH, { force: true }), rm(OFFSET_PATH, { force: true })]);
   console.log('[runner] starting scanner + queue enricher', JSON.stringify({
-    version: '2.4.0',
+    version: '2.4.1',
     queue: QUEUE_PATH,
     sqliteFirst: true,
     persistenceProxy: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
@@ -86,6 +89,7 @@ async function main() {
   startEnricher();
   const scanner = spawnNode('rh_newcoin_scanner.mjs', 'scanner', {
     SHEET_WEBHOOK_URL: `http://127.0.0.1:${PERSIST_PROXY_PORT}/ingest`,
+    SHEET_INGEST_SECRET: LOCAL_PERSIST_SECRET,
   });
 
   scanner.on('exit', (code, signal) => {
