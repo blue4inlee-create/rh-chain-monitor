@@ -1,11 +1,13 @@
-// Robinhood Chain 新币扫描 Webhook 接收器 v3-fast
-// 目标：降低 Apps Script / Google Sheets 往返次数，避免 enrichment 高峰超时。
+// Robinhood Chain 新币扫描 Webhook 接收器 v3.1-fast
+// 核心：已有 CA 更新不再抢全局锁；只有真正 append 新行时加锁。
+// 同时节流 Last Discovery 状态写入，避免每个新币多一次 Sheet 往返。
 const RH_INGEST_CFG = {
   spreadsheetId: '1Z1OU8bVZb_c2RFyponEx9uJSlDAaSOMH0wLORZGJRww',
   discoverySheet: '新币发现',
   statusSheet: '扫描状态',
   secretProperty: 'INGEST_SECRET',
-  rowCacheSeconds: 21600
+  rowCacheSeconds: 21600,
+  statusThrottleSeconds: 60
 };
 
 function doPost(e) {
@@ -25,7 +27,7 @@ function doPost(e) {
       payload.latest_block != null
     ) {
       writeScannerStatusFast_(payload);
-      return jsonResponse_({ ok: true, handled: 'status', version: 'v3-fast' });
+      return jsonResponse_({ ok: true, handled: 'status', version: 'v3.1-fast' });
     }
 
     const ca = normalizeAddress_(firstDefined_(payload, [
@@ -34,28 +36,20 @@ function doPost(e) {
     ]));
     if (!ca) return jsonResponse_({ ok: false, error: 'missing_token_ca' }, 400);
 
-    const lock = LockService.getScriptLock();
-    lock.waitLock(10000);
-    let result;
-    try {
-      result = upsertDiscoveryFast_(payload, ca);
-    } finally {
-      lock.releaseLock();
-    }
-
+    const result = upsertDiscoveryFast_(payload, ca);
     return jsonResponse_({
       ok: true,
       handled: 'discovery',
       row: result.row,
       created: result.created,
       ca: ca,
-      version: 'v3-fast'
+      version: 'v3.1-fast'
     });
   } catch (err) {
     return jsonResponse_({
       ok: false,
       error: String(err && err.message ? err.message : err),
-      version: 'v3-fast'
+      version: 'v3.1-fast'
     }, 500);
   }
 }
@@ -63,7 +57,7 @@ function doPost(e) {
 function doGet() {
   return jsonResponse_({
     ok: true,
-    service: 'rh-chain-monitor-ingest-v3-fast',
+    service: 'rh-chain-monitor-ingest-v3.1-fast',
     time: new Date().toISOString()
   });
 }
@@ -95,14 +89,45 @@ function upsertDiscoveryFast_(p, ca) {
   if (!sh) throw new Error('discovery_sheet_missing');
 
   const now = new Date();
-  const existingRow = findRowByCaFast_(sh, ca);
-  const created = !existingRow;
-  const row = existingRow || Math.max(2, sh.getLastRow() + 1);
+  let row = findRowByCaFast_(sh, ca);
+  let created = false;
 
-  const values = created
-    ? new Array(30).fill('')
-    : sh.getRange(row, 1, 1, 30).getValues()[0];
+  // 已有 CA：完全不抢全局锁，直接更新这一行。
+  if (row) {
+    const values = sh.getRange(row, 1, 1, 30).getValues()[0];
+    applyPayloadToRow_(values, p, ca, now, false);
+    sh.getRange(row, 1, 1, 30).setValues([values]);
+    cacheCaRow_(ca, row);
+    maybeUpdateLastDiscovery_(ss, p, ca, now);
+    return { row: row, created: false };
+  }
 
+  // 只有 append 新行才需要锁，避免两个并发请求创建重复 CA。
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    row = findRowByCaFast_(sh, ca);
+    if (row) {
+      const values = sh.getRange(row, 1, 1, 30).getValues()[0];
+      applyPayloadToRow_(values, p, ca, now, false);
+      sh.getRange(row, 1, 1, 30).setValues([values]);
+    } else {
+      row = Math.max(2, sh.getLastRow() + 1);
+      const values = new Array(30).fill('');
+      applyPayloadToRow_(values, p, ca, now, true);
+      sh.getRange(row, 1, 1, 30).setValues([values]);
+      created = true;
+    }
+    cacheCaRow_(ca, row);
+  } finally {
+    lock.releaseLock();
+  }
+
+  maybeUpdateLastDiscovery_(ss, p, ca, now);
+  return { row: row, created: created };
+}
+
+function applyPayloadToRow_(values, p, ca, now, created) {
   const firstSeen = parseDateOrText_(firstDefined_(p, [
     'firstSeen', 'first_seen', 'seenAt', 'seen_at', 'timestamp'
   ])) || now;
@@ -175,25 +200,6 @@ function upsertDiscoveryFast_(p, ca) {
   putIfPresent_(values, 24, riskFlags);
   putIfPresent_(values, 25, enrichment);
   putIfPresent_(values, 29, notes);
-
-  sh.getRange(row, 1, 1, 30).setValues([values]);
-  cacheCaRow_(ca, row);
-
-  const isEnrichment = String(enrichment || '').toLowerCase().indexOf('v2.') === 0;
-  if (!isEnrichment) {
-    updateOneStatusMetricFast_(ss.getSheetByName(RH_INGEST_CFG.statusSheet), {
-      metric: 'Last Discovery',
-      value: (symbol || ca) + '｜' + (stage || 'event'),
-      status: '🟢 已接收',
-      now: now,
-      source: source || 'Webhook',
-      note: 'CA全局去重；First Seen不覆盖',
-      blocked: '否',
-      next: '等待Canary自动评分'
-    });
-  }
-
-  return { row: row, created: created };
 }
 
 function findRowByCaFast_(sh, ca) {
@@ -218,6 +224,32 @@ function cacheCaRow_(ca, row) {
   CacheService.getScriptCache().put(
     'rhca:' + ca.toLowerCase(), String(row), RH_INGEST_CFG.rowCacheSeconds
   );
+}
+
+function maybeUpdateLastDiscovery_(ss, p, ca, now) {
+  const enrichment = String(firstDefined_(p, [
+    'enrichment', 'enrichmentStatus', 'enrichment_status'
+  ]) || '').toLowerCase();
+  if (enrichment.indexOf('v2.') === 0) return;
+
+  const cache = CacheService.getScriptCache();
+  const throttleKey = 'status:last_discovery';
+  if (cache.get(throttleKey)) return;
+  cache.put(throttleKey, '1', RH_INGEST_CFG.statusThrottleSeconds);
+
+  const symbol = firstDefined_(p, ['symbol', 'ticker', 'tokenSymbol', 'token_symbol']);
+  const stage = firstDefined_(p, ['stage', 'phase', 'eventType', 'event_type', 'event', 'status']);
+  const source = firstDefined_(p, ['source', 'platform', 'launcher', 'factoryType', 'factory_type']);
+  updateOneStatusMetricFast_(ss.getSheetByName(RH_INGEST_CFG.statusSheet), {
+    metric: 'Last Discovery',
+    value: (symbol || ca) + '｜' + (stage || 'event'),
+    status: '🟢 已接收',
+    now: now,
+    source: source || 'Webhook',
+    note: 'CA全局去重；First Seen不覆盖；状态写入已节流',
+    blocked: '否',
+    next: '等待Canary自动评分'
+  });
 }
 
 function writeScannerStatusFast_(p) {
