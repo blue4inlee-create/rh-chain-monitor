@@ -6,7 +6,7 @@ import { ensureScoreSchema } from './scoring.mjs';
 import { ensureRiskSchema } from './risk.mjs';
 import { ensureStageSchema, getStageHealth } from './stages.mjs';
 
-export const RESULT_VERSION = '2.15.0';
+export const RESULT_VERSION = '2.16.0';
 
 function text(v) { return v == null ? '' : String(v).trim(); }
 function num(v) {
@@ -55,6 +55,7 @@ function canaryPathStats(ticks, entryPrice, canaryAt) {
 }
 
 function prepareLookups(db) {
+  const hasMarlin30 = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='marlin_30s'").get());
   return {
     pool: db.prepare(`SELECT * FROM pools WHERE token_address=? ORDER BY discovered_at ASC, id ASC LIMIT 1`),
     latestSnapshot: db.prepare(`SELECT * FROM snapshots WHERE token_address=? ORDER BY snapshot_at DESC, id DESC LIMIT 1`),
@@ -65,6 +66,7 @@ function prepareLookups(db) {
     canaryTicks: db.prepare(`SELECT tick_at, price_usd FROM market_ticks WHERE token_address=? AND tick_at>=? AND price_usd IS NOT NULL ORDER BY tick_at ASC, id ASC`),
     riskRows: db.prepare(`SELECT check_name, status, severity, value, details FROM risk_checks WHERE token_address=? AND snapshot_type=? ORDER BY severity DESC, check_name ASC`),
     snapshotNear: db.prepare(`SELECT * FROM snapshots WHERE token_address=? ORDER BY ABS(julianday(snapshot_at) - julianday(?)) ASC, id DESC LIMIT 1`),
+    marlin30: hasMarlin30 ? db.prepare(`SELECT * FROM marlin_30s WHERE token_address=? LIMIT 1`) : null,
   };
 }
 
@@ -93,6 +95,7 @@ function discoveryRows(db, lookup, limit) {
     const latest = lookup.latestSnapshot.get(t.token_address) || {};
     const initial = lookup.initialSnapshot.get(t.token_address) || {};
     const score = lookup.latestScore.get(t.token_address) || {};
+    const m30 = lookup.marlin30 ? (lookup.marlin30.get(t.token_address) || {}) : {};
     const risks = summarizeRisk(lookup.riskRows.all(t.token_address, text(latest.snapshot_type)));
     const ageSec = Math.max(0, Math.round((now - new Date(t.first_seen_at).getTime()) / 1000));
     const txCount = num(latest.buy_count) != null && num(latest.sell_count) != null
@@ -105,6 +108,14 @@ function discoveryRows(db, lookup, limit) {
       discoveryMax != null ? `DiscoveryMax=${discoveryMax.toFixed(3)}x` : '',
       discoveryNow != null ? `DiscoveryNow=${discoveryNow.toFixed(3)}x` : '',
     ].filter(Boolean).join(' | ');
+    const marlin = [
+      num(m30.age_sec) != null ? `M30@${Number(m30.age_sec).toFixed(1)}s` : '',
+      num(m30.price_change_pct) != null ? `M30Δ=${Number(m30.price_change_pct).toFixed(1)}%` : '',
+      num(m30.reserve_usd) != null ? `M30Reserve=$${Number(m30.reserve_usd).toFixed(0)}` : '',
+      num(m30.curve_progress_pct) != null ? `M30Progress=${Number(m30.curve_progress_pct).toFixed(1)}%` : '',
+      num(m30.score_at_observation) != null ? `M30Score=${Number(m30.score_at_observation).toFixed(1)}` : '',
+      Number(m30.graduated || 0) === 1 ? 'M30Graduated=1' : '',
+    ].filter(Boolean).join(' | ');
     return [
       safe(t.first_seen_at), safe(t.discovery_block), ageSec, safe(t.symbol), t.token_address,
       safe(t.first_source), safe(pool.source || t.first_source), safe(pool.pool_key || t.first_pool_key),
@@ -112,7 +123,7 @@ function discoveryRows(db, lookup, limit) {
       safe(initial.liquidity_usd), '', txCount, safe(latest.buy_count), safe(latest.sell_count),
       safe(t.creator_address), safe(latest.holder_count), '', risks.safety, mechanism,
       safe(score.final_score), safe(score.confidence), safe(t.monitor_stage || 'DISCOVERY'),
-      shortJson([risks.detail, latest.source_status, tracking].filter(Boolean).join(' | '), 700),
+      shortJson([risks.detail, latest.source_status, tracking, marlin].filter(Boolean).join(' | '), 700),
       safe(pool.pool_key || t.first_pool_key), '', mechanism, safe(t.discovery_tx), ''
     ];
   });
