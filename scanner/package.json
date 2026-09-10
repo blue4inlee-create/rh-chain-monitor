@@ -1,6 +1,6 @@
 {
   "name": "rh-newcoin-scanner",
-  "version": "2.4.1",
+  "version": "2.4.2",
   "private": true,
   "type": "module",
   "scripts": {
