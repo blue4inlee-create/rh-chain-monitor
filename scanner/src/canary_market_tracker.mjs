@@ -84,7 +84,7 @@ async function readContract(address, abi, functionName, args = []) {
 async function fetchJson(url, timeoutMs = 7000) {
   try {
     const res = await fetch(url, {
-      headers: { accept: 'application/json', 'user-agent': 'rh-canary-market-tracker/2.12.0' },
+      headers: { accept: 'application/json', 'user-agent': 'rh-canary-market-tracker/2.13.0' },
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) return { ok: false, status: res.status, data: null };
@@ -199,7 +199,10 @@ function dueCanaries() {
     WHERE t.monitor_stage IN ('CANARY','EARLY_ALPHA','CONFIRMED_ALPHA','SIZE_UP')
     GROUP BY t.token_address
     HAVING last_tick_at IS NULL OR last_tick_at <= ?
-    ORDER BY COALESCE(last_tick_at, t.canary_at, t.first_seen_at) ASC
+    ORDER BY
+      CASE WHEN last_tick_at IS NULL THEN 0 ELSE 1 END ASC,
+      CASE WHEN last_tick_at IS NULL THEN t.canary_at END DESC,
+      last_tick_at ASC
     LIMIT ?
   `).all(cutoff, CFG.batchSize);
 }
@@ -237,7 +240,8 @@ async function main() {
   ensurePriceMilestoneSchema();
   ensureAthSchema();
   console.log('[canary tracker boot]', JSON.stringify({
-    version: '2.12.0',
+    version: '2.13.0',
+    priority: 'new-untracked-first',
     cycleMs: CFG.cycleMs,
     minIntervalMs: CFG.minIntervalMs,
     batchSize: CFG.batchSize,
