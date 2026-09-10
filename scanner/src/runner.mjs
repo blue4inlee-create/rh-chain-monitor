@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { rm, readFile, writeFile } from 'node:fs/promises';
+import { initializeDatabase } from './db.mjs';
 
 const ROOT = new URL('.', import.meta.url);
 const QUEUE_PATH = process.env.ENRICH_QUEUE_PATH || '/tmp/rh_enrich_queue.jsonl';
@@ -55,8 +56,10 @@ async function probeVolume() {
 
 async function main() {
   await probeVolume();
+  const dbStatus = initializeDatabase();
+  console.log('[sqlite boot]', JSON.stringify(dbStatus));
   await Promise.all([rm(QUEUE_PATH, { force: true }), rm(OFFSET_PATH, { force: true })]);
-  console.log('[runner] starting scanner + queue enricher', JSON.stringify({ version: '2.2.0', queue: QUEUE_PATH }));
+  console.log('[runner] starting scanner + queue enricher', JSON.stringify({ version: '2.3.0', queue: QUEUE_PATH }));
   startEnricher();
   const scanner = spawnNode('rh_newcoin_scanner.mjs', 'scanner');
 
