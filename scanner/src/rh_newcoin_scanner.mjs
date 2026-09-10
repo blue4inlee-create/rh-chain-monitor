@@ -5,6 +5,12 @@ import {
   decodeAbiParameters, getAddress,
 } from 'viem';
 import { loadScannerCursor, saveScannerCursor } from './scanner_state.mjs';
+import {
+  ensureCurveFirstSwapSchema,
+  loadPendingCurveRegistry,
+  persistCurveFirstSwap,
+  getCurveFirstSwapHealth,
+} from './curve_first_swap.mjs';
 
 const CFG = {
   chainId: 4663,
@@ -24,6 +30,7 @@ const CFG = {
   v4PoolManager: norm(process.env.UNIV4_POOL_MANAGER || '0x8366a39cc670b4001a1121b8f6a443a643e40951'),
   v3Factory: norm(process.env.UNIV3_FACTORY || ''),
   weth: norm(process.env.WETH || '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73'),
+  curveBatchSize: Math.max(25, Math.min(500, Number(process.env.CURVE_LOG_BATCH_SIZE || 250))),
 };
 
 const QUOTES = new Set([CFG.weth, ...(process.env.QUOTE_TOKENS || '').split(',').map(norm)]
@@ -34,6 +41,8 @@ const PONS_GRADUATED = '0x0a44ef75df69c534f43cd6c1aa3ef8983065fe5fe79ef9e79f6494
 const V4_INIT_TOPIC = '0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438';
 const V4_INIT = parseAbiItem('event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)');
 const V3_POOL_CREATED = parseAbiItem('event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)');
+const CURVE_BUY = parseAbiItem('event CurveBuy(address indexed buyer, address indexed recipient, uint256 quoteIn, uint256 tokensOut, uint256 fee, uint256 tax)');
+const CURVE_SELL = parseAbiItem('event CurveSell(address indexed seller, address indexed recipient, uint256 tokensIn, uint256 quoteOut, uint256 fee, uint256 tax)');
 
 const client = createPublicClient({
   chain: { id: CFG.chainId, name: 'Robinhood Chain',
@@ -46,8 +55,11 @@ const state = {
   startedAt:new Date().toISOString(),lastBlock:null,lastPollAt:null,lastHeartbeatAt:null,
   lastEventAt:null,eventsSeen:0,webhookOk:0,webhookFail:0,queueWrites:0,queueErrors:0,
   rawOutbox:0,lastError:null,cursorSource:null,cursorSavedAt:null,
+  curveRegistry:0,curveFirstSwapCaptured:0,lastCurveFirstSwap:null,
 };
 const seen = new Map(), rawOutbox = [];
+const curveRegistry = new Map();
+const blockTimeCache = new Map();
 let rawWebhookActive = 0, queueWriteTail = Promise.resolve();
 
 function norm(v){const s=String(v||'').trim();return /^0x[a-fA-F0-9]{40}$/.test(s)?s:''}
@@ -56,6 +68,7 @@ function isQuote(a){return a&&QUOTES.has(a.toLowerCase())}
 function tokenFromPair(a,b){if(isQuote(a)&&!isQuote(b))return b;if(isQuote(b)&&!isQuote(a))return a;return ''}
 function hexBlock(n){return '0x'+BigInt(n).toString(16)}
 function blockNum(v){try{return Number(BigInt(v||0))}catch{return 0}}
+function logIndex(v){try{return Number(BigInt(v||0))}catch{return 0}}
 function deDupeKey(p){return [p.stage,p.tokenCa,p.pool,p.txHash].filter(Boolean).join('|').toLowerCase()}
 function shouldEmit(p){
   const k=deDupeKey(p);if(!k)return true;
@@ -63,6 +76,33 @@ function shouldEmit(p){
   seen.set(k,now);
   if(seen.size>5000)for(const [key,ts] of seen)if(now-ts>6*60*60*1000)seen.delete(key);
   return true;
+}
+function registerCurve({curve,token,launchAt='',launchBlock=null,pairToken=''}){
+  const c=norm(curve),t=norm(token);if(!c||!t)return false;
+  const key=c.toLowerCase();
+  if(!curveRegistry.has(key))curveRegistry.set(key,{curve:c,token:t,launchAt,pairToken,launchBlock});
+  else {
+    const old=curveRegistry.get(key);
+    curveRegistry.set(key,{...old,curve:c,token:t,launchAt:launchAt||old.launchAt,pairToken:pairToken||old.pairToken,launchBlock:launchBlock??old.launchBlock});
+  }
+  state.curveRegistry=curveRegistry.size;return true;
+}
+function primeCurveRegistry(){
+  ensureCurveFirstSwapSchema();
+  const rows=loadPendingCurveRegistry(5000);
+  for(const r of rows)registerCurve({curve:r.curve_address,token:r.token_address,launchAt:r.launch_at||'',launchBlock:r.launch_block,pairToken:r.quote_token||''});
+  console.log('[curve-registry]',JSON.stringify({mode:'centralized',loaded:rows.length,active:curveRegistry.size,batchSize:CFG.curveBatchSize}));
+}
+async function blockEventTime(blockNumber){
+  const n=blockNum(blockNumber);if(!n)return new Date().toISOString();
+  if(blockTimeCache.has(n))return blockTimeCache.get(n);
+  try{
+    const b=await client.getBlock({blockNumber:BigInt(n)});
+    const iso=new Date(Number(b.timestamp)*1000).toISOString();
+    blockTimeCache.set(n,iso);
+    if(blockTimeCache.size>1000)blockTimeCache.delete(blockTimeCache.keys().next().value);
+    return iso;
+  }catch{return new Date().toISOString()}
 }
 
 async function postWebhook(payload){
@@ -116,7 +156,10 @@ async function handlePons(log,topic0){
     const token=topicAddress(log.topics?.[1]),curve=topicAddress(log.topics?.[2]),deployer=topicAddress(log.topics?.[3]);
     if(!token)return;
     let pairToken='';try{pairToken=norm(decodeAbiParameters([{type:'address'},{type:'uint256'},{type:'uint256'}],log.data||'0x')?.[0])}catch{}
-    await emit({...baseLogPayload(log),source:'Pons V2',stage:'TokenLaunched',tokenCa:token,pool:curve,
+    const launchAt=await blockEventTime(log.blockNumber);
+    registerCurve({curve,token,launchAt,launchBlock:blockNum(log.blockNumber),pairToken});
+    console.log('[launch]',JSON.stringify({token,curve,block:blockNum(log.blockNumber),chainTime:launchAt,tx:log.transactionHash||''}));
+    await emit({...baseLogPayload(log),firstSeen:launchAt,chainTime:launchAt,source:'Pons V2',stage:'TokenLaunched',tokenCa:token,pool:curve,
       deployer,pairToken,pairType:isQuote(pairToken)?'Quote':'',enrichment:'raw-chain'});
   }else if(topic0===PONS_GRADUATED){
     const token=topicAddress(log.topics?.[1]);if(!token)return;
@@ -134,6 +177,26 @@ async function handleV4(log){
   }catch(e){console.warn('[v4 decode]',String(e?.message||e))}
 }
 
+async function handleCurveFirstSwap(log,direction){
+  const key=String(log.address||'').toLowerCase();
+  const reg=curveRegistry.get(key);if(!reg)return;
+  const chainTime=await blockEventTime(log.blockNumber);
+  const detectedAt=new Date().toISOString();
+  const event={
+    ...baseLogPayload(log),firstSeen:chainTime,chainTime,detectedAt,
+    source:'Pons V2',stage:'First Swap',tokenCa:reg.token,pool:reg.curve,
+    pairToken:reg.pairToken||'',pairType:'Curve',direction,launchAt:reg.launchAt||'',
+    notes:`centralized Curve${direction==='buy'?'Buy':'Sell'} first real trade`,enrichment:'raw-chain',
+  };
+  const saved=persistCurveFirstSwap(event);
+  if(!saved?.inserted){curveRegistry.delete(key);state.curveRegistry=curveRegistry.size;return}
+  state.curveFirstSwapCaptured++;
+  state.lastCurveFirstSwap={token:reg.token,curve:reg.curve,direction,block:blockNum(log.blockNumber),tx:log.transactionHash||'',chainTime,detectedAt,launchAt:reg.launchAt||'',launchToSwapSec:saved.launchToSwapSec};
+  curveRegistry.delete(key);state.curveRegistry=curveRegistry.size;
+  console.log('[curve-first-swap]',JSON.stringify(state.lastCurveFirstSwap));
+  await emit(event);
+}
+
 async function scanCombined(fromBlock,toBlock){
   const addresses=[CFG.ponsV2Factory,CFG.v4PoolManager].filter(Boolean).map(getAddress);
   const logs=await client.request({method:'eth_getLogs',params:[{
@@ -148,9 +211,25 @@ async function scanCombined(fromBlock,toBlock){
     else if(a===v4&&t===V4_INIT_TOPIC)await handleV4(log);
   }
 }
+async function scanCurveTrades(fromBlock,toBlock){
+  if(!curveRegistry.size)return;
+  const addresses=[...curveRegistry.values()].map(x=>x.curve);
+  for(let i=0;i<addresses.length;i+=CFG.curveBatchSize){
+    const batch=addresses.slice(i,i+CFG.curveBatchSize).map(getAddress);
+    const [buys,sells]=await Promise.all([
+      client.getLogs({address:batch,event:CURVE_BUY,fromBlock:BigInt(fromBlock),toBlock:BigInt(toBlock)}),
+      client.getLogs({address:batch,event:CURVE_SELL,fromBlock:BigInt(fromBlock),toBlock:BigInt(toBlock)}),
+    ]);
+    const events=[
+      ...buys.map(log=>({log,direction:'buy'})),
+      ...sells.map(log=>({log,direction:'sell'})),
+    ].sort((a,b)=>blockNum(a.log.blockNumber)-blockNum(b.log.blockNumber)||logIndex(a.log.logIndex)-logIndex(b.log.logIndex));
+    for(const e of events)await handleCurveFirstSwap(e.log,e.direction);
+  }
+}
 async function scanV3(fromBlock,toBlock){
   if(!CFG.v3Factory)return;
-  const logs=await client.getLogs({address:getAddress(CFG.v3Factory),event:V3_POOL_CREATED,fromBlock,toBlock});
+  const logs=await client.getLogs({address:getAddress(CFG.v3Factory),event:V3_POOL_CREATED,fromBlock:BigInt(fromBlock),toBlock:BigInt(toBlock)});
   for(const log of logs)try{
     const d=decodeEventLog({abi:[V3_POOL_CREATED],data:log.data,topics:log.topics});
     const a=norm(d.args.token0),b=norm(d.args.token1),token=tokenFromPair(a,b);if(!token)continue;
@@ -164,6 +243,8 @@ async function scanRange(fromBlock,toBlock){
   try{await scanCombined(fromBlock,toBlock)}
   catch(e){state.lastError=`combined: ${String(e?.message||e)}`;console.error('[scan]',state.lastError);
     if(state.lastError.includes('429'))await new Promise(r=>setTimeout(r,4000))}
+  try{await scanCurveTrades(fromBlock,toBlock)}
+  catch(e){state.lastError=`curve-first-swap: ${String(e?.message||e)}`;console.error('[scan]',state.lastError)}
   if(CFG.v3Factory)try{await scanV3(fromBlock,toBlock)}
   catch(e){state.lastError=`v3: ${String(e?.message||e)}`;console.error('[scan]',state.lastError)}
 }
@@ -173,10 +254,11 @@ function heartbeat(){
   if(rawOutbox.length>50)return;
   enqueueRawWebhook({kind:'heartbeat',heartbeat:state.lastHeartbeatAt,latestBlock:state.lastBlock,
     provider:'Robinhood RPC polling',listeners:{'Pons V2':Boolean(CFG.ponsV2Factory),
-      'Uniswap V4':Boolean(CFG.v4PoolManager),'Uniswap V3':Boolean(CFG.v3Factory)}});
+      'Pons Curve First Swap':'centralized','Uniswap V4':Boolean(CFG.v4PoolManager),'Uniswap V3':Boolean(CFG.v3Factory)}});
 }
 
 async function mainLoop(){
+  primeCurveRegistry();
   let latest=await client.getBlockNumber();
   const saved=loadScannerCursor(CFG.scannerName);
   let cursor;
@@ -190,12 +272,12 @@ async function mainLoop(){
     state.cursorSource='startup-backfill';
   }
   state.lastBlock=Number(cursor);
-  console.log('[boot]',JSON.stringify({version:'2.3.0',scanMode:'combined-log-filter',chainId:CFG.chainId,
+  console.log('[boot]',JSON.stringify({version:'2.4.0',scanMode:'combined-log-filter+centralized-curve-first-swap',chainId:CFG.chainId,
     rpc:CFG.rpcUrl,pollMs:CFG.pollMs,backfillBlocks:CFG.backfillBlocks,reorgBlocks:CFG.reorgBlocks,
     cursorSource:state.cursorSource,savedCursor:saved?.lastBlock||null,startCursor:Number(cursor),
     webhookConfigured:Boolean(CFG.webhookUrl&&CFG.webhookSecret),dryRun:CFG.dryRun,
     legacyEnricher:CFG.legacyEnricher,ponsV2Factory:CFG.ponsV2Factory,v4PoolManager:CFG.v4PoolManager,
-    v3Factory:CFG.v3Factory||null,quoteTokens:[...QUOTES]}));
+    v3Factory:CFG.v3Factory||null,curveRegistry:curveRegistry.size,curveBatchSize:CFG.curveBatchSize,quoteTokens:[...QUOTES]}));
   while(true){
     try{
       latest=await client.getBlockNumber();state.lastPollAt=new Date().toISOString();
@@ -221,9 +303,10 @@ async function mainLoop(){
 
 const server=http.createServer((req,res)=>{
   if(req.url==='/health'){
+    let curveHealth=null;try{curveHealth=getCurveFirstSwapHealth()}catch(e){curveHealth={error:String(e?.message||e)}}
     res.writeHead(200,{'content-type':'application/json'});
-    res.end(JSON.stringify({ok:true,service:'rh-newcoin-scanner',version:'2.3.0',...state,
-      scannerName:CFG.scannerName,legacyEnricher:CFG.legacyEnricher,
+    res.end(JSON.stringify({ok:true,service:'rh-newcoin-scanner',version:'2.4.0',...state,
+      scannerName:CFG.scannerName,legacyEnricher:CFG.legacyEnricher,curveMode:'centralized',curveHealth,
       webhookConfigured:Boolean(CFG.webhookUrl&&CFG.webhookSecret),dryRun:CFG.dryRun}));return;
   }
   res.writeHead(404,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,error:'not_found'}));
