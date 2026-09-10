@@ -15,6 +15,7 @@ import {
   getDatabaseHealth,
 } from './db.mjs';
 import { saveRiskChecks } from './risk.mjs';
+import { saveScore } from './scoring.mjs';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 const CFG = {
@@ -80,7 +81,7 @@ async function fetchJson(url, timeoutMs = 7000, headers = {}) {
     const res = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'rh-chain-monitor-job-worker/2.6',
+        'user-agent': 'rh-chain-monitor-job-worker/2.7',
         ...headers,
       },
       signal: AbortSignal.timeout(timeoutMs),
@@ -298,6 +299,7 @@ async function enrichJob(job) {
     pairToken: pons.pairToken || payload.pairToken || '',
     sourceStatus,
   });
+  const score = saveScore({ snapshot, pons });
 
   completeJob(job.job_id);
   return {
@@ -313,6 +315,12 @@ async function enrichJob(job) {
     holders: snapshot.holder_count,
     priceChangePct: snapshot.price_change_pct,
     risk: risk.counts,
+    score: {
+      final: score.final_score,
+      confidence: score.confidence,
+      alpha: score.alpha_score,
+      version: score.score_version,
+    },
     status: snapshot.source_status,
   };
 }
@@ -320,7 +328,7 @@ async function enrichJob(job) {
 async function main() {
   const db = initializeDatabase();
   console.log('[job worker boot]', JSON.stringify({
-    version: '2.6.0',
+    version: '2.7.0',
     pollMs: CFG.pollMs,
     blockscoutKeyConfigured: Boolean(CFG.blockscoutKey),
     ...db,
