@@ -1,14 +1,15 @@
 {
   "name": "rh-newcoin-scanner",
-  "version": "2.2.1",
+  "version": "2.3.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node src/runner.mjs",
-    "check": "node --check src/runner.mjs && node --check src/rh_newcoin_scanner.mjs && node --check src/enricher.mjs && node --check src/smoke.mjs",
+    "check": "node --check src/db.mjs && node --check src/runner.mjs && node --check src/rh_newcoin_scanner.mjs && node --check src/enricher.mjs && node --check src/smoke.mjs",
     "smoke": "node src/smoke.mjs"
   },
   "dependencies": {
+    "better-sqlite3": "11.10.0",
     "viem": "2.37.3"
   },
   "engines": {
