@@ -10,7 +10,7 @@ import { ensurePriceMilestoneSchema } from './price_milestones.mjs';
 import { ensureAthSchema, recordMarketTick, getAthHealth } from './ath_metrics.mjs';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
-const VERSION = '2.16.0-marlin30';
+const VERSION = '2.16.1-marlin30';
 const CFG = {
   chainId: 4663,
   rpc: process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com',
@@ -364,7 +364,7 @@ function dueMarlinWindows() {
       AND NOT EXISTS (
         SELECT 1 FROM marlin_30s w WHERE w.token_address=t.token_address
       )
-    ORDER BY t.first_seen_at ASC
+    ORDER BY t.first_seen_at DESC
     LIMIT ?
   `).all(oldest, newest, CFG.marlinMinScore, CFG.marlinBatchSize);
 }
@@ -507,7 +507,7 @@ async function main() {
   ensureMarlinSchema();
   console.log('[canary tracker boot]', JSON.stringify({
     version: VERSION,
-    priority: 'marlin30-observe + new-canary-first + near-miss-shadow',
+    priority: 'fresh-marlin30 + new-canary-first + near-miss-shadow',
     cycleMs: CFG.cycleMs,
     minIntervalMs: CFG.minIntervalMs,
     batchSize: CFG.batchSize,
@@ -527,6 +527,7 @@ async function main() {
       maxAgeMs: CFG.marlinMaxAgeMs,
       pollMs: CFG.marlinPollMs,
       batchSize: CFG.marlinBatchSize,
+      ordering: 'freshest-eligible-first',
     },
     ...getAthHealth(),
   }));
