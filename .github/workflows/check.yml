@@ -30,8 +30,10 @@ jobs:
       - name: History outcome synthetic check
         working-directory: scanner
         run: npm run history-check
-      - name: Check alert setup script
-        run: bash -n scanner/scripts/configure_alert_channels.sh
+      - name: Check deployment scripts
+        run: |
+          bash -n scanner/scripts/configure_alert_channels.sh
+          bash -n scanner/scripts/deploy_history_v1.sh
       - name: Robinhood RPC smoke test
         working-directory: scanner
         run: npm run smoke
