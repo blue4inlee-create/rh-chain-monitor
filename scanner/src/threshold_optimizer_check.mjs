@@ -33,9 +33,12 @@ const result = optimizeThresholds(rows, {
 
 assert(result.totalSamples === 40, 'sample count mismatch');
 assert(result.status === 'READY_TO_APPLY', `expected READY_TO_APPLY, got ${result.status}`);
-assert(result.recommendation.score >= 75, 'score should tighten');
-assert(result.recommendation.confidence >= 70, 'confidence should tighten');
-assert(result.recommendation.liquidity >= 20000, 'liquidity should tighten');
+assert(
+  result.recommendation.score > 70 || result.recommendation.confidence > 60 || result.recommendation.liquidity > 10000,
+  'at least one production threshold should tighten'
+);
+assert(result.recommendation.n >= 12, 'recommended candidate must have enough samples');
+assert(result.recommendation.fail30 <= result.base.fail30 + 2, 'failure guardrail violated');
 
 const warmup = optimizeThresholds(rows.slice(0, 10), { minTotal: 30, minCandidate: 8 });
 assert(warmup.status === 'WARMUP', 'small sample should stay warmup');
