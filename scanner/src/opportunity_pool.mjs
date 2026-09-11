@@ -1,11 +1,13 @@
-// Opportunity Pool v1
+// Opportunity Pool v2
 // Central layer for candidates that are worth manual review.
+
+import { scoreOpportunity, classifyOpportunityScore } from './opportunity_score.mjs';
 
 const DEFAULT_STATUS = 'watching';
 
 export function normalizeOpportunity(input = {}) {
-  return {
-    address: input.address || input.ca || '',
+  const base = {
+    address: String(input.address || input.ca || '').toLowerCase(),
     symbol: input.symbol || '',
     name: input.name || '',
     source: input.source || 'scanner',
@@ -15,11 +17,31 @@ export function normalizeOpportunity(input = {}) {
     liquidity: Number(input.liquidity || 0),
     volume24h: Number(input.volume24h || 0),
     holders: Number(input.holders || 0),
-    score: Number(input.score || 0),
+    holderGrowth: input.holderGrowth ?? null,
+    buys: input.buys ?? null,
+    sells: input.sells ?? null,
+    buyVolumeUsd: input.buyVolumeUsd ?? null,
+    sellVolumeUsd: input.sellVolumeUsd ?? null,
+    narrativeType: input.narrativeType || input.type || '',
+    isApplication: Boolean(input.isApplication),
+    isPlatform: Boolean(input.isPlatform),
+    hasProduct: Boolean(input.hasProduct),
+    hasRevenue: Boolean(input.hasRevenue),
+    top10HolderPct: input.top10HolderPct ?? null,
+    devHolderPct: input.devHolderPct ?? null,
+    devNewWallet: Boolean(input.devNewWallet),
+    firstPostIsCa: Boolean(input.firstPostIsCa),
+    honeypot: Boolean(input.honeypot),
+    blacklistRisk: Boolean(input.blacklistRisk),
+    mintRisk: Boolean(input.mintRisk),
+    lpRisk: Boolean(input.lpRisk),
+    riskFlags: Array.isArray(input.riskFlags) ? input.riskFlags : [],
     createdAt: input.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    tags: Array.isArray(input.tags) ? input.tags : []
+    tags: Array.isArray(input.tags) ? input.tags : [],
   };
+
+  return scoreOpportunity(base);
 }
 
 export function buildOpportunityPool(records = []) {
@@ -30,7 +52,5 @@ export function buildOpportunityPool(records = []) {
 }
 
 export function classifyOpportunity(item) {
-  if (item.score >= 80) return 'candidate';
-  if (item.score >= 50) return 'watch';
-  return 'observe';
+  return classifyOpportunityScore(item?.score || 0);
 }
