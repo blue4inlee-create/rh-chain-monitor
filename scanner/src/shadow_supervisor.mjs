@@ -5,6 +5,7 @@ let runner = null;
 let shadow = null;
 let opportunityWorker = null;
 let alertWorker = null;
+let shadowThresholdWorker = null;
 let historyWorker = null;
 let historyExport = null;
 let storageMaintenance = null;
@@ -49,6 +50,16 @@ function startAlertWorker() {
     if (stopping) return;
     console.error(`[shadow-supervisor alert-worker] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
     setTimeout(startAlertWorker, 5000).unref();
+  });
+}
+
+function startShadowThresholdWorker() {
+  if (stopping) return;
+  shadowThresholdWorker = start('./shadow_threshold_worker.mjs', 'shadow-threshold-worker');
+  shadowThresholdWorker.on('exit', (code, signal) => {
+    if (stopping) return;
+    console.error(`[shadow-supervisor shadow-threshold-worker] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
+    setTimeout(startShadowThresholdWorker, 5000).unref();
   });
 }
 
@@ -99,6 +110,7 @@ function shutdown(signal) {
   if (storageMaintenance && !storageMaintenance.killed) storageMaintenance.kill(signal);
   if (historyExport && !historyExport.killed) historyExport.kill(signal);
   if (historyWorker && !historyWorker.killed) historyWorker.kill(signal);
+  if (shadowThresholdWorker && !shadowThresholdWorker.killed) shadowThresholdWorker.kill(signal);
   if (alertWorker && !alertWorker.killed) alertWorker.kill(signal);
   if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill(signal);
   if (shadow && !shadow.killed) shadow.kill(signal);
@@ -109,6 +121,7 @@ runner = start('./runner.mjs', 'runner');
 startShadow();
 startOpportunityWorker();
 startAlertWorker();
+startShadowThresholdWorker();
 startHistoryWorker();
 startHistoryExport();
 startStorageMaintenance();
@@ -124,6 +137,7 @@ runner.on('exit', (code, signal) => {
     if (storageMaintenance && !storageMaintenance.killed) storageMaintenance.kill('SIGTERM');
     if (historyExport && !historyExport.killed) historyExport.kill('SIGTERM');
     if (historyWorker && !historyWorker.killed) historyWorker.kill('SIGTERM');
+    if (shadowThresholdWorker && !shadowThresholdWorker.killed) shadowThresholdWorker.kill('SIGTERM');
     if (alertWorker && !alertWorker.killed) alertWorker.kill('SIGTERM');
     if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill('SIGTERM');
     if (shadow && !shadow.killed) shadow.kill('SIGTERM');

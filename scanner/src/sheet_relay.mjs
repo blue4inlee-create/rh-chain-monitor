@@ -12,6 +12,7 @@ const UPSTREAMS = new Map([
   ['/history.csv', String(process.env.VPS_HISTORY_URL || '').trim()],
   ['/calibration.csv', String(process.env.VPS_CALIBRATION_URL || '').trim()],
   ['/thresholds.csv', String(process.env.VPS_THRESHOLDS_URL || '').trim()],
+  ['/shadow.csv', String(process.env.VPS_SHADOW_URL || '').trim()],
 ]);
 
 function readUpstream(upstreamUrl) {
@@ -26,18 +27,9 @@ function readUpstream(upstreamUrl) {
 
   return new Promise((resolve, reject) => {
     const request = https.request({
-      protocol: 'https:',
-      host: connectHost,
-      port,
-      path,
-      method: 'GET',
-      servername,
+      protocol: 'https:', host: connectHost, port, path, method: 'GET', servername,
       rejectUnauthorized: true,
-      headers: {
-        Host: target.host,
-        'User-Agent': 'rh-vps-sheet-relay/1.5',
-        Accept: 'text/csv,*/*;q=0.8',
-      },
+      headers: { Host: target.host, 'User-Agent': 'rh-vps-sheet-relay/1.6', Accept: 'text/csv,*/*;q=0.8' },
     }, (upstream) => {
       const chunks = [];
       let size = 0;
@@ -83,10 +75,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     res.writeHead(200, {
-      'content-type': 'text/csv; charset=utf-8',
-      'cache-control': 'no-store, max-age=0',
-      'x-rh-relay-source': 'vps',
-      'x-rh-relay-path': url.pathname,
+      'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store, max-age=0',
+      'x-rh-relay-source': 'vps', 'x-rh-relay-path': url.pathname,
     });
     res.end(upstream.body);
   } catch (err) {
