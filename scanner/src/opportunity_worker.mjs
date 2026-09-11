@@ -26,6 +26,22 @@ function fastRows(db) {
   return db.prepare('SELECT * FROM marlin_30s').all();
 }
 
+function latestRiskChecks(db) {
+  if (!tableExists(db, 'risk_checks')) return [];
+  return db.prepare(`
+    SELECT token_address, check_name, status, severity, value, details, source, checked_at
+    FROM (
+      SELECT r.*,
+             ROW_NUMBER() OVER (
+               PARTITION BY token_address, check_name
+               ORDER BY checked_at DESC, id DESC
+             ) AS rn
+      FROM risk_checks r
+    )
+    WHERE rn=1
+  `).all();
+}
+
 function canaryRows(tokens = []) {
   return tokens.map(t => ({
     token_address: t.token_address,
@@ -40,15 +56,18 @@ export function refreshOpportunityPool() {
   const snapshots = latestSnapshots(db);
   const fastM30 = fastRows(db);
   const canary = canaryRows(tokens);
-  const pool = buildOpportunityCandidates({ tokens, snapshots, fastM30, canary });
+  const riskChecks = latestRiskChecks(db);
+  const pool = buildOpportunityCandidates({ tokens, snapshots, fastM30, canary, riskChecks });
   const top = pool.slice(0, 5).map(x => ({
     symbol: x.symbol,
     address: x.address,
     score: x.score,
     classification: x.classification,
     confidence: x.confidence,
+    riskGate: x.riskGate,
+    hardFailCount: x.hardFailCount,
   }));
-  return { tokens: tokens.length, rows: pool.length, top };
+  return { tokens: tokens.length, rows: pool.length, riskChecks: riskChecks.length, top };
 }
 
 async function main() {
