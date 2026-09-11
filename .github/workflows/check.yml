@@ -27,6 +27,9 @@ jobs:
       - name: Alert worker synthetic check
         working-directory: scanner
         run: npm run alert-check
+      - name: History outcome synthetic check
+        working-directory: scanner
+        run: npm run history-check
       - name: Check alert setup script
         run: bash -n scanner/scripts/configure_alert_channels.sh
       - name: Robinhood RPC smoke test
