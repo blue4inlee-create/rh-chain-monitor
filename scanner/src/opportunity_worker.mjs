@@ -1,7 +1,7 @@
 import { initializeDatabase, getDatabase, closeDatabase } from './db.mjs';
 import { buildOpportunityCandidates } from './opportunity_pool_sync.mjs';
 
-const INTERVAL_MS = Math.max(30_000, Number(process.env.OPPORTUNITY_REFRESH_MS || 60_000));
+const INTERVAL_MS = Math.max(30_000, Number(process.env.OPPORTUNITY_REFRESH_MS || 30_000));
 let stopping = false;
 
 function tableExists(db, name) {
