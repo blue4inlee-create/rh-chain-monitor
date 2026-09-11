@@ -24,6 +24,9 @@ jobs:
       - name: Opportunity risk gate synthetic check
         working-directory: scanner
         run: npm run risk-gate-check
+      - name: Alert worker synthetic check
+        working-directory: scanner
+        run: npm run alert-check
       - name: Robinhood RPC smoke test
         working-directory: scanner
         run: npm run smoke
