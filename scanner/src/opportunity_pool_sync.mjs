@@ -1,7 +1,8 @@
-// Opportunity Pool data bridge v2
-// Aggregates scanner outputs into ranked Opportunity Pool candidates.
+// Opportunity Pool data bridge v3
+// Aggregates scanner outputs + latest risk checks into ranked candidates.
 
 import { normalizeOpportunity, buildOpportunityPool } from './opportunity_pool.mjs';
+import { summarizeOpportunityRisk } from './opportunity_risk_gate.mjs';
 import { saveOpportunityRows } from './opportunity_repository.mjs';
 
 const lc = v => String(v || '').toLowerCase();
@@ -10,22 +11,42 @@ function keyedMap(rows = []) {
   return new Map(rows.map(x => [lc(x.token_address || x.address || x.ca), x]));
 }
 
+function groupedMap(rows = []) {
+  const out = new Map();
+  for (const row of rows) {
+    const key = lc(row.token_address || row.address || row.ca);
+    if (!key) continue;
+    if (!out.has(key)) out.set(key, []);
+    out.get(key).push(row);
+  }
+  return out;
+}
+
 function parsePayload(value) {
   if (!value) return {};
   if (typeof value === 'object') return value;
   try { return JSON.parse(value); } catch { return {}; }
 }
 
-export function buildOpportunityCandidates({ tokens = [], snapshots = [], fastM30 = [], canary = [] } = {}) {
+function checkValue(checks, name) {
+  const row = (checks || []).find(x => String(x.check_name || x.name || '').toUpperCase() === name);
+  if (!row || row.value === '' || row.value == null) return null;
+  const n = Number(String(row.value).replace('%', ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+export function buildOpportunityCandidates({ tokens = [], snapshots = [], fastM30 = [], canary = [], riskChecks = [] } = {}) {
   const snapshotMap = keyedMap(snapshots);
   const fastMap = keyedMap(fastM30);
   const canaryMap = keyedMap(canary);
+  const riskMap = groupedMap(riskChecks);
 
   const rows = tokens.map(token => {
     const key = lc(token.token_address || token.address || token.ca);
     const snapshot = snapshotMap.get(key) || {};
     const fast = fastMap.get(key) || {};
     const canaryRow = canaryMap.get(key) || {};
+    const checks = riskMap.get(key) || [];
     const tokenPayload = parsePayload(token.raw_payload || token.payload);
     const snapshotPayload = parsePayload(snapshot.raw_data || snapshot.payload);
     const fastPayload = parsePayload(fast.payload || fast.reason_json);
@@ -37,7 +58,7 @@ export function buildOpportunityCandidates({ tokens = [], snapshots = [], fastM3
       ...(Array.isArray(fastPayload.riskFlags) ? fastPayload.riskFlags : []),
     ];
 
-    return normalizeOpportunity({
+    const base = normalizeOpportunity({
       address: key,
       symbol: token.symbol,
       name: token.name,
@@ -57,8 +78,8 @@ export function buildOpportunityCandidates({ tokens = [], snapshots = [], fastM3
       isPlatform: tokenPayload.isPlatform ?? canaryRow.isPlatform,
       hasProduct: tokenPayload.hasProduct ?? canaryRow.hasProduct,
       hasRevenue: tokenPayload.hasRevenue ?? canaryRow.hasRevenue,
-      top10HolderPct: snapshotPayload.top10HolderPct ?? fastPayload.top10HolderPct,
-      devHolderPct: snapshotPayload.devHolderPct ?? tokenPayload.devHolderPct,
+      top10HolderPct: checkValue(checks, 'TOP10_CONCENTRATION') ?? snapshotPayload.top10HolderPct ?? fastPayload.top10HolderPct,
+      devHolderPct: checkValue(checks, 'DEV_CONCENTRATION') ?? snapshotPayload.devHolderPct ?? tokenPayload.devHolderPct,
       devNewWallet: tokenPayload.devNewWallet,
       firstPostIsCa: tokenPayload.firstPostIsCa,
       honeypot: tokenPayload.honeypot ?? snapshotPayload.honeypot,
@@ -68,6 +89,11 @@ export function buildOpportunityCandidates({ tokens = [], snapshots = [], fastM3
       riskFlags,
       tags: ['rh', stage, ...(Array.isArray(canaryRow.tags) ? canaryRow.tags : [])],
     });
+
+    return {
+      ...base,
+      ...summarizeOpportunityRisk({ checks, riskFlags: base.riskFlags, liquidity: base.liquidity }),
+    };
   });
 
   const pool = buildOpportunityPool(rows);
