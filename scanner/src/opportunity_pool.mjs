@@ -36,6 +36,14 @@ export function normalizeOpportunity(input = {}) {
     mintRisk: Boolean(input.mintRisk),
     lpRisk: Boolean(input.lpRisk),
     riskFlags: Array.isArray(input.riskFlags) ? input.riskFlags : [],
+    riskGate: input.riskGate || 'CAUTION',
+    buyBlocked: Boolean(input.buyBlocked),
+    riskConfidence: Number(input.riskConfidence || 0),
+    hardFailCount: Number(input.hardFailCount || 0),
+    warnCount: Number(input.warnCount || 0),
+    criticalUnknownCount: Number(input.criticalUnknownCount || 0),
+    criticalUnknown: Array.isArray(input.criticalUnknown) ? input.criticalUnknown : [],
+    riskReasons: Array.isArray(input.riskReasons) ? input.riskReasons : [],
     createdAt: input.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     tags: Array.isArray(input.tags) ? input.tags : [],
@@ -48,7 +56,10 @@ export function buildOpportunityPool(records = []) {
   return records
     .map(normalizeOpportunity)
     .filter(item => item.address || item.symbol)
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => {
+      if (a.buyBlocked !== b.buyBlocked) return a.buyBlocked ? 1 : -1;
+      return b.score - a.score;
+    });
 }
 
 export function classifyOpportunity(item) {
