@@ -12,8 +12,8 @@ const {
   syncOutcomesFromAlerts,
   recordOutcomeSample,
   recomputeOutcome,
-  getCalibrationRows,
 } = await import('./signal_outcomes.mjs');
+const { getHistoryCalibrationRows } = await import('./history_calibration.mjs');
 
 function assert(ok, message) {
   if (!ok) throw new Error(message);
@@ -88,7 +88,7 @@ try {
   assert(Number(row.clean_win_30) === 1, 'expected clean +30 before -30');
   assert(Number(row.max_drawdown_pct) <= -49.9, 'expected peak-to-trough drawdown');
   assert(row.outcome_label === 'MULTIBAGGER', 'expected multibagger label');
-  const calibration = getCalibrationRows();
+  const calibration = getHistoryCalibrationRows();
   assert(calibration.some(x => x.dimension === 'Score' && x.bucket === '85+'), 'score calibration bucket missing');
   console.log('history worker check ok');
 } finally {
