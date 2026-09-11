@@ -7,8 +7,8 @@ import {
   recordOutcomeSample,
   recomputeOutcome,
   recomputeOpenOutcomes,
-  getCalibrationRows,
 } from './signal_outcomes.mjs';
+import { getHistoryCalibrationRows } from './history_calibration.mjs';
 
 const CFG = {
   pollMs: Math.max(10_000, Number(process.env.HISTORY_POLL_MS || 15_000)),
@@ -83,7 +83,7 @@ async function cycle() {
   }
 
   if (added || sampled || Date.now() - lastSummaryAt >= 5 * 60_000) {
-    const calibration = getCalibrationRows();
+    const calibration = getHistoryCalibrationRows();
     console.log('[history worker]', JSON.stringify({
       added,
       open: open.length,
