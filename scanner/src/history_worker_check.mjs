@@ -4,6 +4,7 @@ const path = `/tmp/rh-history-check-${process.pid}.db`;
 process.env.SQLITE_PATH = path;
 
 const { initializeDatabase, getDatabase, closeDatabase } = await import('./db.mjs');
+const { ensureStageSchema } = await import('./stages.mjs');
 const { ensurePriceMilestoneSchema } = await import('./price_milestones.mjs');
 const { ensureAthSchema, recordMarketTick } = await import('./ath_metrics.mjs');
 const {
@@ -21,6 +22,7 @@ function iso(base, ms) { return new Date(new Date(base).getTime() + ms).toISOStr
 
 try {
   initializeDatabase();
+  ensureStageSchema();
   ensurePriceMilestoneSchema();
   ensureAthSchema();
   ensureSignalOutcomeSchema();
