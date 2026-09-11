@@ -5,9 +5,13 @@ import { initializeDatabase, closeDatabase } from './db.mjs';
 import { initializeDeadLetterStore, getDeadLetterStats } from './dead_letter.mjs';
 import { ensurePriceMilestoneSchema, getPriceMilestoneHealth } from './price_milestones.mjs';
 import { ensureAthSchema, getAthHealth } from './ath_metrics.mjs';
+import { ensureStageSchema } from './stages.mjs';
+import { ensureRiskSchema } from './risk.mjs';
+import { ensureScoreSchema } from './scoring.mjs';
 import { startPersistenceProxy } from './persistence_proxy.mjs';
 import { ensureOpsSchema, recordOpsEvent, writeRuntimeStatus, STATUS_PATH } from './ops_status.mjs';
 import { buildSheetPayload, rowsToCsv } from './sheet_data.mjs';
+import { getOpportunityExportRows } from './opportunity_export.mjs';
 
 const VERSION = '2.14.1';
 const ROOT = new URL('.', import.meta.url);
@@ -175,12 +179,24 @@ function cachedSheetPayload() {
   return payload;
 }
 
+function opportunityExportRows() {
+  const header = ['Symbol','CA','Stage','Score','Classification','Confidence','ScoreVersion','Heat','LiquidityScore','Flow','HolderScore','ProjectScore','RiskPenalty','MarketCap','Liquidity','Volume24h','Holders','Buys','Sells','HolderGrowth','NarrativeType','RiskFlags','Tags','UpdatedAt'];
+  const rows = getOpportunityExportRows(500).map(r => [
+    r.symbol, r.address, r.stage, r.score, r.classification, r.scoreConfidence, r.scoreVersion,
+    r.heatScore, r.liquidityScore, r.flowScore, r.holderScore, r.projectScore, r.riskPenalty,
+    r.marketCap, r.liquidity, r.volume24h, r.holders, r.buys, r.sells, r.holderGrowth,
+    r.narrativeType, (r.riskFlags || []).join('|'), (r.tags || []).join('|'), r.updatedAt
+  ]);
+  return [header, ...rows];
+}
+
 function exportRows(pathname) {
   const payload = cachedSheetPayload();
   if (pathname === '/export/discovery.csv') return payload.sheets['新币发现'];
   if (pathname === '/export/canary.csv') return payload.sheets['Canary跟踪'];
   if (pathname === '/export/stages.csv') return payload.sheets['阶段升级记录'];
   if (pathname === '/export/lifecycle.csv') return payload.sheets['生命周期'];
+  if (pathname === '/export/opportunity.csv') return opportunityExportRows();
   return null;
 }
 
@@ -256,6 +272,9 @@ async function main() {
 
   initializeDeadLetterStore();
   console.log('[dead letter boot]', JSON.stringify(getDeadLetterStats()));
+  ensureRiskSchema();
+  ensureScoreSchema();
+  ensureStageSchema();
   ensurePriceMilestoneSchema();
   console.log('[price milestones boot]', JSON.stringify(getPriceMilestoneHealth()));
   ensureAthSchema();
