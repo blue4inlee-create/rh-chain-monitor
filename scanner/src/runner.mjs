@@ -25,6 +25,8 @@ const UPSTREAM_SHEET_WEBHOOK_URL = String(process.env.SHEET_WEBHOOK_URL || '').t
 const RESULT_SHEET_WEBHOOK_URL = String(process.env.RESULT_SHEET_WEBHOOK_URL || '').trim();
 const UPSTREAM_SHEET_SECRET = String(process.env.SHEET_INGEST_SECRET || '').trim();
 const RESULT_EXPORT_TOKEN = String(process.env.RESULT_EXPORT_TOKEN || '').trim();
+const VPS_OPPORTUNITY_URL = String(process.env.VPS_OPPORTUNITY_URL || '').trim();
+const SHEET_RELAY_TOKEN = String(process.env.SHEET_RELAY_TOKEN || '').trim();
 const LOCAL_PERSIST_SECRET = 'sqlite-local-ingest';
 const LEGACY_ENRICHER = /^(1|true|yes)$/i.test(String(process.env.LEGACY_ENRICHER_ENABLED || 'false'));
 let stopping = false;
@@ -208,6 +210,31 @@ function startHealthServer() {
       res.writeHead(body.ok ? 200 : 503, { 'content-type':'application/json', 'cache-control':'no-store' });
       res.end(JSON.stringify(body));
       return;
+    }
+
+    if (url.pathname === '/relay/opportunity.csv') {
+      if (!VPS_OPPORTUNITY_URL || !SHEET_RELAY_TOKEN || url.searchParams.get('token') !== SHEET_RELAY_TOKEN) {
+        res.writeHead(401, { 'content-type':'text/plain; charset=utf-8', 'cache-control':'no-store' });
+        res.end('unauthorized\n');
+        return;
+      }
+      try {
+        const upstream = await fetch(VPS_OPPORTUNITY_URL, { signal: AbortSignal.timeout(15_000) });
+        if (!upstream.ok) throw new Error(`upstream_${upstream.status}`);
+        const csv = await upstream.text();
+        res.writeHead(200, {
+          'content-type':'text/csv; charset=utf-8',
+          'cache-control':'no-store, max-age=0',
+          'x-rh-relay-source':'vps',
+        });
+        res.end(csv);
+        return;
+      } catch (err) {
+        console.error('[vps opportunity relay]', err?.message || err);
+        res.writeHead(502, { 'content-type':'text/plain; charset=utf-8', 'cache-control':'no-store' });
+        res.end('upstream_error\n');
+        return;
+      }
     }
 
     if (url.pathname.startsWith('/export/')) {
