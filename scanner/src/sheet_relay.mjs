@@ -11,6 +11,7 @@ const UPSTREAMS = new Map([
   ['/opportunity.csv', String(process.env.VPS_OPPORTUNITY_URL || '').trim()],
   ['/history.csv', String(process.env.VPS_HISTORY_URL || '').trim()],
   ['/calibration.csv', String(process.env.VPS_CALIBRATION_URL || '').trim()],
+  ['/thresholds.csv', String(process.env.VPS_THRESHOLDS_URL || '').trim()],
 ]);
 
 function readUpstream(upstreamUrl) {
@@ -34,7 +35,7 @@ function readUpstream(upstreamUrl) {
       rejectUnauthorized: true,
       headers: {
         Host: target.host,
-        'User-Agent': 'rh-vps-sheet-relay/1.4',
+        'User-Agent': 'rh-vps-sheet-relay/1.5',
         Accept: 'text/csv,*/*;q=0.8',
       },
     }, (upstream) => {

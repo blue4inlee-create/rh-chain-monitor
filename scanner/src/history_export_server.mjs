@@ -2,6 +2,7 @@ import http from 'node:http';
 import { initializeDatabase, closeDatabase } from './db.mjs';
 import { ensureSignalOutcomeSchema, getOutcomeRows } from './signal_outcomes.mjs';
 import { getHistoryCalibrationRows } from './history_calibration.mjs';
+import { getThresholdOptimizationRows } from './threshold_optimizer.mjs';
 import { rowsToCsv } from './sheet_data.mjs';
 
 const PORT = Math.max(1024, Number(process.env.HISTORY_EXPORT_PORT || 3105));
@@ -39,12 +40,28 @@ function calibrationRows() {
   return [header, ...rows];
 }
 
+function thresholdRows() {
+  const header = [
+    'RowType','Status','TotalSamples','CurrentScore','CurrentConfidence','CurrentLP',
+    'RecommendedScore','RecommendedConfidence','RecommendedLP','CandidateSamples',
+    'BaselineUtility','CandidateUtility','DeltaUtility','CleanWin30Rate','Hit50Rate','Hit100Rate',
+    'Fail30Rate','Median24h','MedianMFE','MedianMDD','CoveragePct','Reason'
+  ];
+  const rows = getThresholdOptimizationRows(12).map(r => [
+    r.rowType, r.status, r.samples, r.score, r.confidence, r.liquidity,
+    r.recommendedScore, r.recommendedConfidence, r.recommendedLiquidity, r.candidateSamples,
+    r.utility, r.recommendedUtility, r.deltaUtility, r.cleanWin30Rate, r.hit50Rate, r.hit100Rate,
+    r.fail30Rate, r.median24h, r.medianMfe, r.medianMdd, r.coverage, r.reason,
+  ]);
+  return [header, ...rows];
+}
+
 function sendCsv(res, rows) {
   const csv = rowsToCsv(rows);
   res.writeHead(200, {
     'content-type': 'text/csv; charset=utf-8',
     'cache-control': 'no-store, max-age=0',
-    'x-rh-history-version': '1',
+    'x-rh-history-version': '2',
   });
   res.end(csv);
 }
@@ -57,11 +74,12 @@ async function main() {
     try {
       if (url.pathname === '/health') {
         res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-        res.end(JSON.stringify({ ok: true, service: 'history-export', port: PORT }));
+        res.end(JSON.stringify({ ok: true, service: 'history-export', port: PORT, thresholdOptimizer: true }));
         return;
       }
       if (url.pathname === '/history.csv') return sendCsv(res, outcomeRows());
       if (url.pathname === '/calibration.csv') return sendCsv(res, calibrationRows());
+      if (url.pathname === '/thresholds.csv') return sendCsv(res, thresholdRows());
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('not_found\n');
     } catch (err) {
@@ -74,7 +92,7 @@ async function main() {
     server.once('error', reject);
     server.listen(PORT, '127.0.0.1', resolve);
   });
-  console.log('[history export boot]', JSON.stringify({ address: `http://127.0.0.1:${PORT}` }));
+  console.log('[history export boot]', JSON.stringify({ address: `http://127.0.0.1:${PORT}`, thresholdOptimizer: true }));
 }
 
 function shutdown() {
