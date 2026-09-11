@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 let stopping = false;
 let runner = null;
 let shadow = null;
+let opportunityWorker = null;
 let compareReport = null;
 let compareTimer = null;
 
@@ -27,6 +28,16 @@ function startShadow() {
   });
 }
 
+function startOpportunityWorker() {
+  if (stopping) return;
+  opportunityWorker = start('./opportunity_worker.mjs', 'opportunity-worker');
+  opportunityWorker.on('exit', (code, signal) => {
+    if (stopping) return;
+    console.error(`[shadow-supervisor opportunity-worker] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
+    setTimeout(startOpportunityWorker, 5000).unref();
+  });
+}
+
 function startCompareReport() {
   if (stopping || (compareReport && compareReport.exitCode == null && !compareReport.killed)) return;
   compareReport = start('./fast_m30_compare_report.mjs', 'fast-compare');
@@ -41,12 +52,14 @@ function shutdown(signal) {
   stopping = true;
   if (compareTimer) clearInterval(compareTimer);
   if (compareReport && !compareReport.killed) compareReport.kill(signal);
+  if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill(signal);
   if (shadow && !shadow.killed) shadow.kill(signal);
   if (runner && !runner.killed) runner.kill(signal);
 }
 
 runner = start('./runner.mjs', 'runner');
 startShadow();
+startOpportunityWorker();
 setTimeout(startCompareReport, 15000).unref();
 compareTimer = setInterval(startCompareReport, 300000);
 compareTimer.unref();
@@ -56,6 +69,7 @@ runner.on('exit', (code, signal) => {
     stopping = true;
     if (compareTimer) clearInterval(compareTimer);
     if (compareReport && !compareReport.killed) compareReport.kill('SIGTERM');
+    if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill('SIGTERM');
     if (shadow && !shadow.killed) shadow.kill('SIGTERM');
   }
   console.error(`[shadow-supervisor runner] exited code=${code ?? ''} signal=${signal || ''}`);
