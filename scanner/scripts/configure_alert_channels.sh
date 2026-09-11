@@ -11,23 +11,60 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exit 1
 fi
 
-read -rsp "Bark device key: " BARK_DEVICE_KEY; echo
-read -rsp "Telegram bot token: " TELEGRAM_BOT_TOKEN; echo
+trim() {
+  local v="$1"
+  v="${v//$'\r'/}"
+  v="${v//$'\n'/}"
+  printf '%s' "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
 
-if [[ -z "$BARK_DEVICE_KEY" || -z "$TELEGRAM_BOT_TOKEN" ]]; then
-  echo "ERROR: Bark key and Telegram bot token are both required"
+read -rsp "Bark device key: " BARK_DEVICE_KEY; echo
+BARK_DEVICE_KEY="$(trim "$BARK_DEVICE_KEY")"
+if [[ -z "$BARK_DEVICE_KEY" ]]; then
+  echo "ERROR: Bark device key is required"
   exit 1
 fi
 
-echo "Validating Telegram bot..."
-BOT_JSON="$(curl -fsS --max-time 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe")"
-python3 - "$BOT_JSON" <<'PY'
+while true; do
+  read -rsp "Telegram bot token: " TELEGRAM_BOT_TOKEN; echo
+  TELEGRAM_BOT_TOKEN="$(trim "$TELEGRAM_BOT_TOKEN")"
+  TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN#bot}"
+
+  if [[ ! "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{20,}$ ]]; then
+    echo "ERROR: This does not look like a BotFather API token."
+    echo "Use the token returned by @BotFather after /newbot, not the bot username or t.me link."
+    continue
+  fi
+
+  echo "Validating Telegram bot..."
+  TMP_JSON="$(mktemp)"
+  HTTP_CODE="$(curl -sS --max-time 10 -o "$TMP_JSON" -w '%{http_code}' "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || true)"
+  BOT_JSON="$(cat "$TMP_JSON")"
+  rm -f "$TMP_JSON"
+
+  if [[ "$HTTP_CODE" != "200" ]]; then
+    if [[ "$HTTP_CODE" == "401" || "$HTTP_CODE" == "404" ]]; then
+      echo "ERROR: Telegram rejected this token (HTTP $HTTP_CODE)."
+      echo "Open @BotFather -> /mybots -> choose your bot -> API Token, then copy the full token again."
+    else
+      echo "ERROR: Telegram validation failed (HTTP ${HTTP_CODE:-unknown})."
+    fi
+    continue
+  fi
+
+  if ! python3 - "$BOT_JSON" <<'PY'
 import json,sys
 j=json.loads(sys.argv[1])
 if not j.get('ok'):
-    raise SystemExit('ERROR: Telegram token invalid')
+    raise SystemExit(1)
 print('Telegram bot OK:', j['result'].get('username',''))
 PY
+  then
+    echo "ERROR: Telegram response was not a valid bot response. Try the token again."
+    continue
+  fi
+  break
+done
 
 echo "Now open Telegram, send /start to your bot, then press Enter here."
 read -r _
