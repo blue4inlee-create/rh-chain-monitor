@@ -10,7 +10,9 @@ const UPSTREAM_SERVERNAME = String(process.env.VPS_UPSTREAM_SERVERNAME || '').tr
 
 function readUpstream() {
   const target = new URL(UPSTREAM_URL);
-  if (UPSTREAM_EXPORT_TOKEN) target.searchParams.set('token', UPSTREAM_EXPORT_TOKEN);
+  if (UPSTREAM_EXPORT_TOKEN && target.pathname.startsWith('/export/')) {
+    target.searchParams.set('token', UPSTREAM_EXPORT_TOKEN);
+  }
   const connectHost = UPSTREAM_IP || target.hostname;
   const servername = UPSTREAM_SERVERNAME || target.hostname;
   const port = Number(target.port || 443);
@@ -27,7 +29,7 @@ function readUpstream() {
       rejectUnauthorized: true,
       headers: {
         Host: target.host,
-        'User-Agent': 'rh-vps-sheet-relay/1.2',
+        'User-Agent': 'rh-vps-sheet-relay/1.3',
         Accept: 'text/csv,*/*;q=0.8',
       },
     }, (upstream) => {
@@ -41,12 +43,9 @@ function readUpstream() {
         }
         chunks.push(chunk);
       });
-      upstream.on('end', () => {
-        resolve({ status: Number(upstream.statusCode || 0), body: Buffer.concat(chunks) });
-      });
+      upstream.on('end', () => resolve({ status: Number(upstream.statusCode || 0), body: Buffer.concat(chunks) }));
       upstream.on('error', reject);
     });
-
     request.setTimeout(15_000, () => request.destroy(new Error('upstream_timeout')));
     request.on('error', reject);
     request.end();
@@ -55,31 +54,21 @@ function readUpstream() {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-
   if (url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-    res.end(JSON.stringify({
-      ok: true,
-      service: 'vps-sheet-relay',
-      upstreamConfigured: Boolean(UPSTREAM_URL),
-      upstreamAuthConfigured: Boolean(UPSTREAM_EXPORT_TOKEN),
-      directIpConfigured: Boolean(UPSTREAM_IP),
-    }));
+    res.end(JSON.stringify({ ok: true, service: 'vps-sheet-relay', upstreamConfigured: Boolean(UPSTREAM_URL), directIpConfigured: Boolean(UPSTREAM_IP) }));
     return;
   }
-
   if (url.pathname !== '/opportunity.csv' || !RELAY_TOKEN || url.searchParams.get('token') !== RELAY_TOKEN) {
     res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
     res.end('unauthorized\n');
     return;
   }
-
   if (!UPSTREAM_URL) {
     res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
     res.end('upstream_not_configured\n');
     return;
   }
-
   try {
     const upstream = await readUpstream();
     if (upstream.status < 200 || upstream.status >= 300) {
@@ -88,23 +77,13 @@ const server = http.createServer(async (req, res) => {
       res.end('upstream_error\n');
       return;
     }
-    res.writeHead(200, {
-      'content-type': 'text/csv; charset=utf-8',
-      'cache-control': 'no-store, max-age=0',
-      'x-rh-relay-source': 'vps',
-    });
+    res.writeHead(200, { 'content-type': 'text/csv; charset=utf-8', 'cache-control': 'no-store, max-age=0', 'x-rh-relay-source': 'vps' });
     res.end(upstream.body);
   } catch (err) {
-    console.error('[relay]', JSON.stringify({
-      message: err?.message || String(err),
-      code: err?.code || err?.cause?.code || '',
-      cause: err?.cause?.message || '',
-    }));
+    console.error('[relay]', JSON.stringify({ message: err?.message || String(err), code: err?.code || err?.cause?.code || '', cause: err?.cause?.message || '' }));
     res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
     res.end('upstream_error\n');
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[vps-sheet-relay] listening on :${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log(`[vps-sheet-relay] listening on :${PORT}`));
