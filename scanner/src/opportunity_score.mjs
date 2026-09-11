@@ -1,7 +1,7 @@
-// Opportunity Score v1
+// Opportunity Score v1.1
 // Portfolio ranking score for Opportunity Pool. Independent from scanner score-v1/v2.
 
-export const OPPORTUNITY_SCORE_VERSION = 'opportunity-score-v1.0';
+export const OPPORTUNITY_SCORE_VERSION = 'opportunity-score-v1.1';
 
 const clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, Number(v) || 0));
 const num = v => {
@@ -113,6 +113,7 @@ function riskPenalty(item) {
   const flags = Array.isArray(item.riskFlags) ? item.riskFlags.map(x => String(x).toLowerCase()) : [];
   const text = flags.join('|');
 
+  if (bool(item.buyBlocked) || String(item.riskGate || '').toUpperCase() === 'BLOCK') penalty += 30;
   if (bool(item.honeypot) || /honeypot/.test(text)) penalty += 30;
   if (bool(item.blacklistRisk) || /blacklist/.test(text)) penalty += 18;
   if (bool(item.mintRisk) || /mint/.test(text)) penalty += 12;
