@@ -4,6 +4,7 @@ let stopping = false;
 let runner = null;
 let shadow = null;
 let opportunityWorker = null;
+let storageMaintenance = null;
 let compareReport = null;
 let compareTimer = null;
 
@@ -38,6 +39,16 @@ function startOpportunityWorker() {
   });
 }
 
+function startStorageMaintenance() {
+  if (stopping) return;
+  storageMaintenance = start('./storage_maintenance.mjs', 'storage-maintenance');
+  storageMaintenance.on('exit', (code, signal) => {
+    if (stopping) return;
+    console.error(`[shadow-supervisor storage-maintenance] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
+    setTimeout(startStorageMaintenance, 10000).unref();
+  });
+}
+
 function startCompareReport() {
   if (stopping || (compareReport && compareReport.exitCode == null && !compareReport.killed)) return;
   compareReport = start('./fast_m30_compare_report.mjs', 'fast-compare');
@@ -52,6 +63,7 @@ function shutdown(signal) {
   stopping = true;
   if (compareTimer) clearInterval(compareTimer);
   if (compareReport && !compareReport.killed) compareReport.kill(signal);
+  if (storageMaintenance && !storageMaintenance.killed) storageMaintenance.kill(signal);
   if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill(signal);
   if (shadow && !shadow.killed) shadow.kill(signal);
   if (runner && !runner.killed) runner.kill(signal);
@@ -60,6 +72,7 @@ function shutdown(signal) {
 runner = start('./runner.mjs', 'runner');
 startShadow();
 startOpportunityWorker();
+startStorageMaintenance();
 setTimeout(startCompareReport, 15000).unref();
 compareTimer = setInterval(startCompareReport, 300000);
 compareTimer.unref();
@@ -69,6 +82,7 @@ runner.on('exit', (code, signal) => {
     stopping = true;
     if (compareTimer) clearInterval(compareTimer);
     if (compareReport && !compareReport.killed) compareReport.kill('SIGTERM');
+    if (storageMaintenance && !storageMaintenance.killed) storageMaintenance.kill('SIGTERM');
     if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill('SIGTERM');
     if (shadow && !shadow.killed) shadow.kill('SIGTERM');
   }
