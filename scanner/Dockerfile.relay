@@ -1,0 +1,6 @@
+FROM node:20-alpine
+WORKDIR /app
+COPY src/sheet_relay.mjs ./sheet_relay.mjs
+ENV NODE_ENV=production
+EXPOSE 8080
+CMD ["node", "sheet_relay.mjs"]
