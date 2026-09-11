@@ -33,11 +33,15 @@ jobs:
       - name: Threshold optimizer synthetic check
         working-directory: scanner
         run: npm run threshold-check
+      - name: Shadow threshold pool synthetic check
+        working-directory: scanner
+        run: npm run shadow-check
       - name: Check deployment scripts
         run: |
           bash -n scanner/scripts/configure_alert_channels.sh
           bash -n scanner/scripts/deploy_history_v1.sh
           bash -n scanner/scripts/deploy_threshold_optimizer_v1.sh
+          bash -n scanner/scripts/deploy_shadow_threshold_pool_v1.sh
       - name: Robinhood RPC smoke test
         working-directory: scanner
         run: npm run smoke
