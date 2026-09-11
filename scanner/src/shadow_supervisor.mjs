@@ -5,6 +5,7 @@ let runner = null;
 let shadow = null;
 let opportunityWorker = null;
 let alertWorker = null;
+let historyWorker = null;
 let storageMaintenance = null;
 let compareReport = null;
 let compareTimer = null;
@@ -50,6 +51,16 @@ function startAlertWorker() {
   });
 }
 
+function startHistoryWorker() {
+  if (stopping) return;
+  historyWorker = start('./history_worker.mjs', 'history-worker');
+  historyWorker.on('exit', (code, signal) => {
+    if (stopping) return;
+    console.error(`[shadow-supervisor history-worker] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
+    setTimeout(startHistoryWorker, 5000).unref();
+  });
+}
+
 function startStorageMaintenance() {
   if (stopping) return;
   storageMaintenance = start('./storage_maintenance.mjs', 'storage-maintenance');
@@ -75,6 +86,7 @@ function shutdown(signal) {
   if (compareTimer) clearInterval(compareTimer);
   if (compareReport && !compareReport.killed) compareReport.kill(signal);
   if (storageMaintenance && !storageMaintenance.killed) storageMaintenance.kill(signal);
+  if (historyWorker && !historyWorker.killed) historyWorker.kill(signal);
   if (alertWorker && !alertWorker.killed) alertWorker.kill(signal);
   if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill(signal);
   if (shadow && !shadow.killed) shadow.kill(signal);
@@ -85,6 +97,7 @@ runner = start('./runner.mjs', 'runner');
 startShadow();
 startOpportunityWorker();
 startAlertWorker();
+startHistoryWorker();
 startStorageMaintenance();
 setTimeout(startCompareReport, 15000).unref();
 compareTimer = setInterval(startCompareReport, 300000);
@@ -96,6 +109,7 @@ runner.on('exit', (code, signal) => {
     if (compareTimer) clearInterval(compareTimer);
     if (compareReport && !compareReport.killed) compareReport.kill('SIGTERM');
     if (storageMaintenance && !storageMaintenance.killed) storageMaintenance.kill('SIGTERM');
+    if (historyWorker && !historyWorker.killed) historyWorker.kill('SIGTERM');
     if (alertWorker && !alertWorker.killed) alertWorker.kill('SIGTERM');
     if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill('SIGTERM');
     if (shadow && !shadow.killed) shadow.kill('SIGTERM');
