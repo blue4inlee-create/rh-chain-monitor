@@ -4,11 +4,13 @@ import https from 'node:https';
 const PORT = Number(process.env.PORT || 8080);
 const UPSTREAM_URL = String(process.env.VPS_OPPORTUNITY_URL || '').trim();
 const RELAY_TOKEN = String(process.env.SHEET_RELAY_TOKEN || '').trim();
+const UPSTREAM_EXPORT_TOKEN = String(process.env.RESULT_EXPORT_TOKEN || '').trim();
 const UPSTREAM_IP = String(process.env.VPS_UPSTREAM_IP || '').trim();
 const UPSTREAM_SERVERNAME = String(process.env.VPS_UPSTREAM_SERVERNAME || '').trim();
 
 function readUpstream() {
   const target = new URL(UPSTREAM_URL);
+  if (UPSTREAM_EXPORT_TOKEN) target.searchParams.set('token', UPSTREAM_EXPORT_TOKEN);
   const connectHost = UPSTREAM_IP || target.hostname;
   const servername = UPSTREAM_SERVERNAME || target.hostname;
   const port = Number(target.port || 443);
@@ -25,7 +27,7 @@ function readUpstream() {
       rejectUnauthorized: true,
       headers: {
         Host: target.host,
-        'User-Agent': 'rh-vps-sheet-relay/1.1',
+        'User-Agent': 'rh-vps-sheet-relay/1.2',
         Accept: 'text/csv,*/*;q=0.8',
       },
     }, (upstream) => {
@@ -60,6 +62,7 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: 'vps-sheet-relay',
       upstreamConfigured: Boolean(UPSTREAM_URL),
+      upstreamAuthConfigured: Boolean(UPSTREAM_EXPORT_TOKEN),
       directIpConfigured: Boolean(UPSTREAM_IP),
     }));
     return;
