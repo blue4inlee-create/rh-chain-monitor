@@ -59,7 +59,7 @@ export function getHistoryCalibrationRows() {
   const db = getDatabase();
   const rows = db.prepare(`
     SELECT * FROM signal_outcomes
-    WHERE status='COMPLETE' AND data_quality<>'THIN'
+    WHERE event_type='EARLY_ALPHA' AND status='COMPLETE' AND data_quality<>'THIN'
   `).all();
   const groups = [];
   const dimensions = [
