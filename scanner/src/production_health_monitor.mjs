@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile, writeFile, rename, statfs } from 'node:fs/promises';
+import { readFile, writeFile, rename, rm, statfs } from 'node:fs/promises';
 
 const execFileAsync = promisify(execFile);
 const CFG = {
@@ -70,9 +70,14 @@ async function loadState() {
   catch { return { active: [], failures: {}, httpsRoutes: {}, lastNotifyAt: null, lastRestartAt: null }; }
 }
 async function writeJson(path, value) {
-  const tmp = `${path}.tmp`;
-  await writeFile(tmp, JSON.stringify(value, null, 2), 'utf8');
-  await rename(tmp, path);
+  const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(value, null, 2), 'utf8');
+    await rename(tmp, path);
+  } catch (err) {
+    try { await rm(tmp, { force: true }); } catch {}
+    throw err;
+  }
 }
 async function cmd(command, args = []) {
   try {
