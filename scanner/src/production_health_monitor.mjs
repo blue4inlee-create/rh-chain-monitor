@@ -21,6 +21,8 @@ const CFG = {
   dbPath: String(process.env.SQLITE_PATH || '/data/rh_monitor.db'),
   statePath: String(process.env.HEALTH_STATE_PATH || '/data/rh_health_monitor_state.json'),
   statusPath: String(process.env.HEALTH_STATUS_PATH || '/data/rh_health_status.json'),
+  poolAuditPath: String(process.env.POOL_DIVERGENCE_STATUS_PATH || '/data/pool_divergence_audit.json'),
+  poolAuditStaleMs: Math.max(900_000, Number(process.env.HEALTH_POOL_AUDIT_STALE_MS || 1_800_000)),
   rpcUrl: String(process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com'),
   publicBase: String(process.env.HEALTH_PUBLIC_BASE || 'https://rh.192-236-234-216.sslip.io:8443').replace(/\/+$/, ''),
   barkServer: String(process.env.BARK_SERVER || 'https://api.day.app').replace(/\/+$/, ''),
@@ -92,6 +94,27 @@ async function diskCheck() {
     return { ok: pct < CFG.diskCritical, warn: pct >= CFG.diskWarn, usedPct: pct };
   } catch (e) { return { ok: false, warn: true, usedPct: null, error: errText(e) }; }
 }
+async function poolAuditCheck() {
+  try {
+    const data = JSON.parse(await readFile(CFG.poolAuditPath, 'utf8'));
+    const age = ageMs(data.generatedAt);
+    const stale = !Number.isFinite(age) || age > CFG.poolAuditStaleMs;
+    const anomalyCount = Number(data.anomalyCount || 0);
+    return {
+      ok: !stale && anomalyCount === 0,
+      stale,
+      ageSec: Number.isFinite(age) ? Math.round(age / 1000) : null,
+      anomalyCount,
+      scanned: Number(data.scanned || 0),
+      checked: Number(data.checked || 0),
+      unverifiable: Number(data.unverifiable || 0),
+      generatedAt: data.generatedAt || null,
+      anomalies: Array.isArray(data.anomalies) ? data.anomalies.slice(0, 5) : [],
+    };
+  } catch (e) {
+    return { ok: false, stale: true, ageSec: null, anomalyCount: 0, error: errText(e), anomalies: [] };
+  }
+}
 function databaseCheck() {
   let db;
   try {
@@ -117,10 +140,10 @@ async function rpcCheck() {
 }
 
 async function collect() {
-  const [main, caddy, scanner, history, disk, rpc] = await Promise.all([
+  const [main, caddy, scanner, history, disk, rpc, poolAudit] = await Promise.all([
     service('rh-chain-monitor.service'), service('caddy.service'),
     httpCheck('http://127.0.0.1:8080/health', true), httpCheck('http://127.0.0.1:3105/health', true),
-    diskCheck(), rpcCheck(),
+    diskCheck(), rpcCheck(), poolAuditCheck(),
   ]);
   const processEntries = await Promise.all(Object.entries(PROCESSES).map(async ([k, p]) => [k, await processCheck(p)]));
   const processes = Object.fromEntries(processEntries);
@@ -130,7 +153,7 @@ async function collect() {
   }));
   const publicRoutes = Object.fromEntries(routeEntries);
   return {
-    checkedAt: nowIso(), main, caddy, scanner, history, disk, rpc,
+    checkedAt: nowIso(), main, caddy, scanner, history, disk, rpc, poolAudit,
     db: databaseCheck(), processes, publicRoutes,
     channels: { bark: Boolean(CFG.barkKey), telegram: Boolean(CFG.telegramToken && CFG.telegramChatId) },
   };
@@ -178,6 +201,8 @@ function incidents(checks, httpsRoutes = {}) {
   const badRoutes = Object.entries(httpsRoutes).filter(([, v]) => v.incident).map(([k]) => k);
   if (badRoutes.length) add('https-exports', 'WARN', `HTTPS 出口连续异常：${badRoutes.join(', ')}`);
   if (!checks.rpc.ok) add('rpc', 'WARN', checks.rpc.rateLimited ? 'Robinhood RPC 触发 429 限流' : `Robinhood RPC 异常 HTTP ${checks.rpc.status || 0}`);
+  if (checks.poolAudit?.stale) add('pool-audit-stale', 'WARN', `跨池巡检未更新${checks.poolAudit.ageSec != null ? `：${checks.poolAudit.ageSec} 秒` : ''}`);
+  else if ((checks.poolAudit?.anomalyCount || 0) > 0) add('pool-divergence', 'WARN', `发现 ${checks.poolAudit.anomalyCount} 个跨池价格/ATH 异常候选`);
   if (checks.disk.usedPct != null && checks.disk.usedPct >= CFG.diskCritical) add('disk', 'CRITICAL', `磁盘使用率 ${checks.disk.usedPct.toFixed(1)}%`);
   else if (checks.disk.warn) add('disk', 'WARN', `磁盘使用率 ${checks.disk.usedPct.toFixed(1)}%`);
   if (CFG.pushAlerts && (!checks.channels.bark || !checks.channels.telegram)) add('channels', 'CRITICAL', 'Bark / Telegram 至少一个未配置');
@@ -299,6 +324,8 @@ export async function runCycle({ forceNotify = false } = {}) {
     opportunityAgeSec: checks.db.opportunityAgeSec,
     pushAlerts: CFG.pushAlerts,
     httpsPending,
+    poolAuditAnomalies: checks.poolAudit?.anomalyCount || 0,
+    poolAuditAgeSec: checks.poolAudit?.ageSec ?? null,
   }));
   return status;
 }
