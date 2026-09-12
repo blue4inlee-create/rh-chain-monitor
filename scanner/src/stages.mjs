@@ -1,4 +1,4 @@
-import { getDatabase } from './db.mjs';
+import { getDatabase, REALTIME_OPPORTUNITY_MAX_AGE_MS } from './db.mjs';
 import { ensureRiskSchema } from './risk.mjs';
 
 function text(v) {
@@ -15,6 +15,13 @@ function safeJson(v) {
 }
 function hasColumn(db, table, column) {
   return db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column);
+}
+
+export function isRealtimeStageWindow(firstSeenAt, snapshotAt, maxAgeMs = REALTIME_OPPORTUNITY_MAX_AGE_MS) {
+  const first = new Date(firstSeenAt || '').getTime();
+  const snap = new Date(snapshotAt || '').getTime();
+  if (!Number.isFinite(first) || !Number.isFinite(snap)) return false;
+  return Math.max(0, snap - first) <= maxAgeMs;
 }
 
 export function ensureStageSchema() {
@@ -140,7 +147,7 @@ export function applyStageDecision({ snapshot = {}, score = {}, pons = {} } = {}
   const db = getDatabase();
   const token = text(snapshot.token_address).toLowerCase();
   if (!/^0x[a-f0-9]{40}$/.test(token)) return { changed: false, stage: 'UNKNOWN', reason: 'invalid_token' };
-  const row = db.prepare('SELECT monitor_stage FROM tokens WHERE token_address=?').get(token);
+  const row = db.prepare('SELECT monitor_stage, first_seen_at FROM tokens WHERE token_address=?').get(token);
   const current = text(row?.monitor_stage) || 'DISCOVERY';
   const risks = loadRisks(db, snapshot);
   const blocker = hardBlocker(risks);
@@ -155,6 +162,15 @@ export function applyStageDecision({ snapshot = {}, score = {}, pons = {} } = {}
 
   if (current !== 'DISCOVERY') {
     return { changed: false, stage: current, reason: 'stage_already_set' };
+  }
+
+  if (!isRealtimeStageWindow(row?.first_seen_at, snapshot?.snapshot_at)) {
+    const firstMs = new Date(row?.first_seen_at || '').getTime();
+    const snapMs = new Date(snapshot?.snapshot_at || '').getTime();
+    const ageSec = Number.isFinite(firstMs) && Number.isFinite(snapMs)
+      ? Math.max(0, Math.round((snapMs - firstMs) / 1000))
+      : null;
+    return { changed: false, stage: current, reason: 'stale_replay_window', ageSec, maxAgeSec: Math.round(REALTIME_OPPORTUNITY_MAX_AGE_MS / 1000) };
   }
 
   const rule = canaryRule({ snapshot, score, pons, risks });

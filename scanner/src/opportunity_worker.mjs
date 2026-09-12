@@ -1,4 +1,4 @@
-import { initializeDatabase, getDatabase, closeDatabase } from './db.mjs';
+import { initializeDatabase, getDatabase, closeDatabase, REALTIME_OPPORTUNITY_MAX_AGE_MS } from './db.mjs';
 import { buildOpportunityCandidates } from './opportunity_pool_sync.mjs';
 
 const INTERVAL_MS = Math.max(30_000, Number(process.env.OPPORTUNITY_REFRESH_MS || 30_000));
@@ -52,7 +52,16 @@ function canaryRows(tokens = []) {
 export function refreshOpportunityPool() {
   initializeDatabase();
   const db = getDatabase();
-  const tokens = db.prepare('SELECT * FROM tokens ORDER BY first_seen_at DESC').all();
+  const totalTokens = Number(db.prepare('SELECT COUNT(*) n FROM tokens').get()?.n || 0);
+  const replayFilter = `(julianday(created_at)-julianday(first_seen_at))*86400000 <= ?`;
+  const tokens = db.prepare(`SELECT * FROM tokens WHERE ${replayFilter} ORDER BY first_seen_at DESC`)
+    .all(REALTIME_OPPORTUNITY_MAX_AGE_MS);
+  const replayRemoved = tableExists(db, 'opportunity_pool')
+    ? db.prepare(`DELETE FROM opportunity_pool WHERE token_address IN (
+        SELECT token_address FROM tokens
+        WHERE (julianday(created_at)-julianday(first_seen_at))*86400000 > ?
+      )`).run(REALTIME_OPPORTUNITY_MAX_AGE_MS).changes
+    : 0;
   const snapshots = latestSnapshots(db);
   const fastM30 = fastRows(db);
   const canary = canaryRows(tokens);
@@ -67,7 +76,15 @@ export function refreshOpportunityPool() {
     riskGate: x.riskGate,
     hardFailCount: x.hardFailCount,
   }));
-  return { tokens: tokens.length, rows: pool.length, riskChecks: riskChecks.length, top };
+  return {
+    tokens: tokens.length,
+    totalTokens,
+    replayExcluded: Math.max(0, totalTokens - tokens.length),
+    replayRemoved,
+    rows: pool.length,
+    riskChecks: riskChecks.length,
+    top,
+  };
 }
 
 async function main() {

@@ -24,6 +24,7 @@ const CFG = {
   rpc: process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com',
   chain: process.env.DEXSCREENER_CHAIN_ID || 'robinhood',
   ponsFactory: process.env.PONS_V2_FACTORY || '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e',
+  multicall3: process.env.MULTICALL3_ADDRESS || '0xcA11bde05977b3631167028862bE2a173976CA11',
   weth: (process.env.WETH || '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73').toLowerCase(),
   blockscoutKey: String(process.env.BLOCKSCOUT_API_KEY || '').trim(),
   blockscoutProBase: (process.env.BLOCKSCOUT_PRO_BASE || 'https://api.blockscout.com/4663/api/v2').replace(/\/$/, ''),
@@ -146,7 +147,7 @@ async function fetchJson(url, timeoutMs = 7000, headers = {}) {
     const res = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'rh-chain-monitor-job-worker/2.9.2',
+        'user-agent': 'rh-chain-monitor-job-worker/2.10.0',
         ...headers,
       },
       signal: AbortSignal.timeout(timeoutMs),
@@ -167,19 +168,50 @@ async function readContract(address, abi, functionName, args = []) {
   }
 }
 
+async function readMulticall(contracts = []) {
+  if (!contracts.length || !validAddress(CFG.multicall3)) return null;
+  try {
+    return await rpcWithRetry(() => client.multicall({
+      multicallAddress: getAddress(CFG.multicall3),
+      allowFailure: true,
+      contracts,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+function multiResult(rows, index) {
+  const row = rows?.[index];
+  return row?.status === 'success' ? row.result : null;
+}
+
 async function onchainTokenMeta(token) {
+  const address = validAddress(token) ? getAddress(token) : null;
+  if (!address) return { name:'', symbol:'', decimals:null, totalSupply:'' };
+  const rows = await readMulticall([
+    { address, abi: erc20Abi, functionName: 'name' },
+    { address, abi: erc20Abi, functionName: 'symbol' },
+    { address, abi: erc20Abi, functionName: 'decimals' },
+    { address, abi: erc20Abi, functionName: 'totalSupply' },
+  ]);
+  if (rows) {
+    const name = multiResult(rows, 0), symbol = multiResult(rows, 1);
+    const decimals = multiResult(rows, 2), totalSupply = multiResult(rows, 3);
+    return {
+      name: text(name),
+      symbol: text(symbol),
+      decimals: decimals == null ? null : Number(decimals),
+      totalSupply: totalSupply == null ? '' : totalSupply.toString(),
+    };
+  }
   const [name, symbol, decimals, totalSupply] = await Promise.all([
     readContract(token, erc20Abi, 'name'),
     readContract(token, erc20Abi, 'symbol'),
     readContract(token, erc20Abi, 'decimals'),
     readContract(token, erc20Abi, 'totalSupply'),
   ]);
-  return {
-    name: text(name),
-    symbol: text(symbol),
-    decimals: decimals == null ? null : Number(decimals),
-    totalSupply: totalSupply == null ? '' : totalSupply.toString(),
-  };
+  return { name:text(name), symbol:text(symbol), decimals:decimals == null ? null : Number(decimals), totalSupply:totalSupply == null ? '' : totalSupply.toString() };
 }
 
 async function blockscoutToken(token) {
@@ -246,6 +278,70 @@ async function quoteUsd(quote) {
   return price;
 }
 
+async function fastPonsContext(token, payload = {}) {
+  if (!/pons/i.test(text(payload.source)) || !validAddress(payload.pool) || !validAddress(payload.pairToken)) return null;
+  const tokenAddress = getAddress(token);
+  const curveAddress = getAddress(payload.pool);
+  const pairAddress = getAddress(payload.pairToken);
+  const quotePromise = quoteUsd(pairAddress);
+  const rows = await readMulticall([
+    { address: tokenAddress, abi: erc20Abi, functionName: 'name' },
+    { address: tokenAddress, abi: erc20Abi, functionName: 'symbol' },
+    { address: tokenAddress, abi: erc20Abi, functionName: 'decimals' },
+    { address: tokenAddress, abi: erc20Abi, functionName: 'totalSupply' },
+    { address: getAddress(CFG.ponsFactory), abi: factoryAbi, functionName: 'getLaunchedToken', args: [tokenAddress] },
+    { address: curveAddress, abi: curveAbi, functionName: 'getReserves' },
+    { address: curveAddress, abi: curveAbi, functionName: 'realQuoteReserve' },
+    { address: pairAddress, abi: erc20Abi, functionName: 'decimals' },
+  ]);
+  if (!rows) return null;
+  const launch = multiResult(rows, 4);
+  if (!launch?.exists || text(launch.curve).toLowerCase() !== text(payload.pool).toLowerCase() || text(launch.pairToken).toLowerCase() !== text(payload.pairToken).toLowerCase()) return null;
+  const decimalsRaw = multiResult(rows, 2);
+  const totalSupplyRaw = multiResult(rows, 3);
+  const tokenMeta = {
+    name: text(multiResult(rows, 0)),
+    symbol: text(multiResult(rows, 1)),
+    decimals: decimalsRaw == null ? null : Number(decimalsRaw),
+    totalSupply: totalSupplyRaw == null ? '' : totalSupplyRaw.toString(),
+  };
+  let qDecimalsRaw = multiResult(rows, 7);
+  let qDecimals = qDecimalsRaw == null ? null : Number(qDecimalsRaw);
+  if (qDecimals == null) qDecimals = await quoteDecimals(pairAddress);
+  else quoteDecimalsCache.set(text(pairAddress).toLowerCase(), qDecimals);
+  const qUsd = await quotePromise;
+  const reserves = multiResult(rows, 5);
+  const realQuote = multiResult(rows, 6);
+  const phase = Number(launch.phase ?? 0);
+  let priceUsd = null, marketCap = null, reserveUsd = null, curveProgressPct = null;
+  if (phase === 0 && reserves && qDecimals != null && tokenMeta.decimals != null && qUsd != null) {
+    const quoteReserve = Number(formatUnits(BigInt(reserves[0]), qDecimals));
+    const tokenReserve = Number(formatUnits(BigInt(reserves[1]), tokenMeta.decimals));
+    if (quoteReserve >= 0 && tokenReserve > 0) priceUsd = (quoteReserve / tokenReserve) * qUsd;
+  }
+  if (priceUsd != null && tokenMeta.totalSupply && tokenMeta.decimals != null) {
+    const supply = Number(formatUnits(BigInt(tokenMeta.totalSupply), tokenMeta.decimals));
+    if (Number.isFinite(supply)) marketCap = priceUsd * supply;
+  }
+  if (phase === 0 && realQuote != null && qDecimals != null && qUsd != null) {
+    const qr = Number(formatUnits(BigInt(realQuote), qDecimals));
+    if (Number.isFinite(qr)) reserveUsd = qr * qUsd;
+  }
+  if (phase === 0 && realQuote != null && launch.graduationThreshold != null && BigInt(launch.graduationThreshold) > 0n) {
+    curveProgressPct = Number(BigInt(realQuote) * 1_000_000n / BigInt(launch.graduationThreshold)) / 10_000;
+  }
+  return {
+    chainMeta: tokenMeta,
+    pons: {
+      isPons: true, curve: text(launch.curve), pairToken: text(launch.pairToken), phase,
+      priceUsd, marketCap, reserveUsd, curveProgressPct,
+      creatorTaxBps: Number(launch.creatorTaxBps ?? 0), buybackEnabled: Boolean(launch.buybackEnabled),
+      poolFee: Number(launch.poolFee ?? 0), deployer: validAddress(launch.deployer) ? launch.deployer : '',
+      fastLane: true,
+    },
+  };
+}
+
 async function ponsCurveMetrics(token, tokenMeta) {
   const launch = await readContract(CFG.ponsFactory, factoryAbi, 'getLaunchedToken', [getAddress(token)]);
   if (!launch?.exists) return { isPons: false };
@@ -301,12 +397,13 @@ async function enrichJob(job) {
   const token = text(job.token_address);
   const payload = job.payload || {};
 
-  const [chainMeta, blockscout, dex] = await Promise.all([
-    onchainTokenMeta(token),
+  const [fastPons, blockscout, dex] = await Promise.all([
+    fastPonsContext(token, payload),
     blockscoutToken(token),
     dexPairs(token),
   ]);
-  const pons = await ponsCurveMetrics(token, chainMeta);
+  const chainMeta = fastPons?.chainMeta || await onchainTokenMeta(token);
+  const pons = fastPons?.pons || await ponsCurveMetrics(token, chainMeta);
   const pair = bestPair(dex.pairs, payload.pool || job.pool_key);
   const txns = pair?.txns?.m5 || {};
   const volume5m = numeric(pair?.volume?.m5);
@@ -359,7 +456,7 @@ async function enrichJob(job) {
       blockscoutMeta: blockscout.meta.data,
       blockscoutCounters: blockscout.holders.data,
       dexPair: pair,
-      rpc: { gapMs: CFG.rpcGapMs, rateLimits: rpcRateLimits, errors: rpcErrors },
+      rpc: { gapMs: CFG.rpcGapMs, rateLimits: rpcRateLimits, errors: rpcErrors, mode: fastPons ? 'pons-multicall3' : 'fallback' },
     },
   });
 
@@ -403,7 +500,7 @@ async function enrichJob(job) {
 async function main() {
   const db = initializeDatabase();
   console.log('[job worker boot]', JSON.stringify({
-    version: '2.9.2',
+    version: '2.10.0-multicall',
     pollMs: CFG.pollMs,
     rpcGapMs: CFG.rpcGapMs,
     blockscoutKeyConfigured: Boolean(CFG.blockscoutKey),

@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 export const DB_PATH = process.env.SQLITE_PATH || '/data/rh_monitor.db';
+export const REALTIME_OPPORTUNITY_MAX_AGE_MS = Math.max(60_000, Number(process.env.REALTIME_OPPORTUNITY_MAX_AGE_MS || 250_000));
 let sharedDb = null;
 
 function ensureParentDir() {
@@ -53,6 +54,20 @@ function pctChange(current, initial) {
   const a = num(current), b = num(initial);
   if (a == null || b == null || b === 0) return null;
   return ((a - b) / b) * 100;
+}
+
+function eventTimestampMs(event = {}) {
+  for (const value of [event.firstSeen, event.event_time, event.chainTime]) {
+    const t = new Date(value || '').getTime();
+    if (Number.isFinite(t)) return t;
+  }
+  return null;
+}
+
+export function isRealtimeDiscoveryEvent(event = {}, nowMs = Date.now(), maxAgeMs = REALTIME_OPPORTUNITY_MAX_AGE_MS) {
+  const eventMs = eventTimestampMs(event);
+  if (!Number.isFinite(eventMs)) return false;
+  return Math.max(0, nowMs - eventMs) <= maxAgeMs;
 }
 
 function migrate(db) {
@@ -255,7 +270,14 @@ function scheduleJobs(db, event, tokenAddress, poolKey, now) {
       retry_count, max_retries, payload, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, 4, ?, ?, ?)
   `);
-  const payload = safeJson(event);
+  const nowMs = new Date(now).getTime();
+  const eventMs = eventTimestampMs(event);
+  const eventAgeMs = Number.isFinite(eventMs) ? Math.max(0, nowMs - eventMs) : null;
+  const replay = !isRealtimeDiscoveryEvent(event, nowMs);
+  const payload = safeJson({
+    ...event,
+    _monitorMeta: { replay, eventAgeMs, realtimeMaxAgeMs: REALTIME_OPPORTUNITY_MAX_AGE_MS },
+  });
   for (const [jobType, delayMs] of specs) {
     const runAt = new Date(Date.now() + delayMs).toISOString();
     const result = stmt.run(
@@ -369,14 +391,22 @@ export function claimDueJob() {
       `).run(now, stale);
     }
 
+    const liveCutoff = new Date(nowMs - REALTIME_OPPORTUNITY_MAX_AGE_MS).toISOString();
     const row = db.prepare(`
       SELECT * FROM jobs
       WHERE status='PENDING'
         AND run_at <= ?
         AND job_type IN ('ENRICH_INITIAL','SNAPSHOT_1M')
-      ORDER BY run_at ASC, job_id ASC
+      ORDER BY
+        CASE WHEN julianday(COALESCE(
+          json_extract(payload,'$.firstSeen'),
+          json_extract(payload,'$.event_time'),
+          json_extract(payload,'$.chainTime'),
+          created_at
+        )) >= julianday(?) THEN 0 ELSE 1 END ASC,
+        run_at ASC, job_id ASC
       LIMIT 1
-    `).get(now);
+    `).get(now, liveCutoff);
     if (!row) return null;
 
     const claimed = db.prepare(`
