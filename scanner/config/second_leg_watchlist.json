@@ -1,0 +1,8 @@
+[
+  {"symbol":"KITSU","address":"0x8d4dFaaA4198b6486E0293Fec914C2B6a821D4DC","preferredPair":"0xfF4BA5ff0a3Fc2EFf177F1C6eE09825bf2111434","athPriceUsd":0.004619,"fallbackRiskGate":"CAUTION"},
+  {"symbol":"POOLS","address":"0x385b36Ff682Ab4C76E7c37A66b96aABC466471d5","preferredPair":"0x88fbd9768ccf1bf77d6946afa1b2f3ce79e02a4566ca8a3d5ba78ab04e8ef27f","athPriceUsd":0.003594,"fallbackRiskGate":"CAUTION"},
+  {"symbol":"PIPEDOG","address":"0x5Cb6F181081301b44905F3ae15419112ecaBd8A6","preferredPair":"0xB7f10f74B39291b9290b779978e19A7637C742D6","athPriceUsd":0.006099,"fallbackRiskGate":"CLEAR"},
+  {"symbol":"UNIPCS","address":"0x7df5daaf80e65dfcc7a1435d9b52bcf2b5753fbe","preferredPair":"0x47631aedb7cc03d2f0d2452dd94fee1f1a149a3792fe9a2b413d4394a1a0f2a4","athPriceUsd":0.009839,"fallbackRiskGate":"BLOCK"},
+  {"symbol":"DTF","address":"0xeE5576Fa1Bcaa380e591D01245f406f3f384eb01","preferredPair":"0xbc58bfe115b23f22d2e97ded5c791ebf6db3d3f510f412908c511da6dc8cb4ee","athPriceUsd":0.0171,"fallbackRiskGate":"CAUTION"},
+  {"symbol":"HOOKR","address":"0x18E674231A58c239Dc7DaeDcffE15Ec3A24cff5c","preferredPair":"0x590dcb6a87828bf688b48089a62239b693378f1fb64d2286e6a399ed8c005fdf","athPriceUsd":null,"fallbackRiskGate":"CAUTION"}
+]

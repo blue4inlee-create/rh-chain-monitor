@@ -27,6 +27,9 @@ jobs:
       - name: Alert worker synthetic check
         working-directory: scanner
         run: npm run alert-check
+      - name: Second-leg alert synthetic check
+        working-directory: scanner
+        run: npm run second-leg-check
       - name: History outcome synthetic check
         working-directory: scanner
         run: npm run history-check
@@ -43,6 +46,7 @@ jobs:
           bash -n scanner/scripts/deploy_threshold_optimizer_v1.sh
           bash -n scanner/scripts/deploy_shadow_threshold_pool_v1.sh
           bash -n scanner/scripts/deploy_health_monitor_v1.sh
+          bash -n scanner/scripts/deploy_second_leg_alert_v1.sh
       - name: Robinhood RPC smoke test
         working-directory: scanner
         run: npm run smoke
