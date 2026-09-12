@@ -10,7 +10,7 @@ import { ensurePriceMilestoneSchema } from './price_milestones.mjs';
 import { ensureAthSchema, recordMarketTick, getAthHealth } from './ath_metrics.mjs';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
-const VERSION = '2.16.1-marlin30';
+const VERSION = '2.16.2-canonical-pair';
 const CFG = {
   chainId: 4663,
   rpc: process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com',
@@ -217,7 +217,9 @@ async function ponsMetrics(row) {
 
 async function marketMetrics(row) {
   const pairs = await dexPairs(row.token_address);
-  const pair = bestPair(pairs, row.first_pool_key);
+  // Token-level tracking must follow the current canonical market, not the first
+  // pool forever. A stale/dust first pool can carry a wildly divergent price.
+  const pair = bestPair(pairs);
   const price = num(pair?.priceUsd);
   if (price != null && price > 0) {
     const txns = pair?.txns?.m5 || {};
@@ -233,7 +235,13 @@ async function marketMetrics(row) {
       reserveUsd: null,
       curveProgressPct: null,
       phase: null,
-      raw: { pairAddress: pair?.pairAddress || '', dexId: pair?.dexId || '' },
+      raw: {
+        pairAddress: pair?.pairAddress || '',
+        dexId: pair?.dexId || '',
+        pairSelection: 'highest_liquidity',
+        firstPoolKey: row.first_pool_key || '',
+        pairCount: pairs.length,
+      },
     };
   }
   return ponsMetrics(row);
