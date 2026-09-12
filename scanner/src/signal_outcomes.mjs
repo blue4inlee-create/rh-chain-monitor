@@ -92,6 +92,7 @@ export function ensureSignalOutcomeSchema() {
       liquidity_usd REAL,
       reserve_usd REAL,
       pool_key TEXT NOT NULL DEFAULT '',
+      canonical INTEGER NOT NULL DEFAULT 0,
       qualified INTEGER NOT NULL DEFAULT 0,
       source TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL,
@@ -107,6 +108,7 @@ export function ensureSignalOutcomeSchema() {
   addColumn(db, 'signal_outcomes', 'raw_max_multiple REAL');
   addColumn(db, 'signal_outcome_ticks', 'reserve_usd REAL');
   addColumn(db, 'signal_outcome_ticks', "pool_key TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'signal_outcome_ticks', 'canonical INTEGER NOT NULL DEFAULT 0');
   addColumn(db, 'signal_outcome_ticks', 'qualified INTEGER NOT NULL DEFAULT 0');
   return db;
 }
@@ -118,14 +120,20 @@ function seedObservation(db, token, triggeredAt) {
     WHERE token_address=? AND price_usd>0 AND tick_at<=?
     ORDER BY tick_at DESC LIMIT 1
   `).get(token, triggeredAt);
-  if (prior) return { ...prior, reserve_usd: num(parsedRaw(prior.raw_data)?.reserveUsd) };
+  if (prior) {
+    const raw = parsedRaw(prior.raw_data);
+    return { ...prior, reserve_usd: num(raw?.reserveUsd), pair_selection: text(raw?.pairSelection) };
+  }
   const after = db.prepare(`
     SELECT tick_at AS at, price_usd, market_cap, liquidity_usd, source,pool_key,raw_data
     FROM market_ticks
     WHERE token_address=? AND price_usd>0 AND tick_at>?
     ORDER BY tick_at ASC LIMIT 1
   `).get(token, triggeredAt);
-  if (after && new Date(after.at).getTime() - new Date(triggeredAt).getTime() <= 10 * 60_000) return { ...after, reserve_usd: num(parsedRaw(after.raw_data)?.reserveUsd) };
+  if (after && new Date(after.at).getTime() - new Date(triggeredAt).getTime() <= 10 * 60_000) {
+    const raw = parsedRaw(after.raw_data);
+    return { ...after, reserve_usd: num(raw?.reserveUsd), pair_selection: text(raw?.pairSelection) };
+  }
   const snap = db.prepare(`
     SELECT snapshot_at AS at, price_usd, market_cap, liquidity_usd, dex AS source,pair_address AS pool_key,raw_data
     FROM snapshots
@@ -133,7 +141,10 @@ function seedObservation(db, token, triggeredAt) {
     ORDER BY ABS(strftime('%s', snapshot_at)-strftime('%s', ?)) ASC
     LIMIT 1
   `).get(token, triggeredAt);
-  if (snap && Math.abs(new Date(snap.at).getTime() - new Date(triggeredAt).getTime()) <= 10 * 60_000) return { ...snap, reserve_usd: num(parsedRaw(snap.raw_data)?.pons?.reserveUsd) };
+  if (snap && Math.abs(new Date(snap.at).getTime() - new Date(triggeredAt).getTime()) <= 10 * 60_000) {
+    const raw = parsedRaw(snap.raw_data);
+    return { ...snap, reserve_usd: num(raw?.pons?.reserveUsd), pair_selection: text(raw?.pairSelection) };
+  }
   const current = db.prepare(`
     SELECT current_price_at AS at, current_price_usd AS price_usd,
            current_market_cap AS market_cap, current_liquidity_usd AS liquidity_usd,
@@ -184,6 +195,7 @@ export function syncOutcomesFromAlerts() {
         liquidityUsd: seed.liquidity_usd,
         reserveUsd: seed.reserve_usd,
         poolKey: seed.pool_key,
+        pairSelection: seed.pair_selection,
         source: seed.source || 'seed',
       });
     }
@@ -191,30 +203,52 @@ export function syncOutcomesFromAlerts() {
   return added;
 }
 
-export function recordOutcomeSample({ eventKey, tokenAddress, sampleAt, priceUsd, marketCap, liquidityUsd, reserveUsd, poolKey = '', source = '' } = {}) {
+function canonicalPoolForToken(db, tokenAddress) {
+  const row = db.prepare(`
+    SELECT pool_key, MAX(liquidity_usd) AS max_liq
+    FROM market_ticks
+    WHERE token_address=?
+      AND lower(source)<>'pons-curve'
+      AND pool_key<>''
+      AND liquidity_usd IS NOT NULL
+    GROUP BY pool_key
+    ORDER BY max_liq DESC, pool_key ASC
+    LIMIT 1
+  `).get(tokenAddress);
+  return text(row?.pool_key).toLowerCase();
+}
+
+export function recordOutcomeSample({ eventKey, tokenAddress, sampleAt, priceUsd, marketCap, liquidityUsd, reserveUsd, poolKey = '', pairSelection = '', source = '' } = {}) {
   const db = ensureSignalOutcomeSchema();
   const price = num(priceUsd);
   if (!eventKey || !tokenAddress || price == null || price <= 0) return { ok: false, reason: 'invalid_sample' };
+  const token = text(tokenAddress).toLowerCase();
   const at = text(sampleAt) || new Date().toISOString();
   const src = text(source).toLowerCase();
   const liq = num(liquidityUsd);
   const reserve = num(reserveUsd);
-  const qualified = src.includes('pons')
+  const pool = text(poolKey).toLowerCase();
+  const selection = text(pairSelection).toLowerCase();
+  const canonicalPool = src.includes('pons') ? '' : canonicalPoolForToken(db, token);
+  const canonicalDex = Boolean(pool) && (selection === 'highest_liquidity' || (canonicalPool && pool === canonicalPool));
+  const canonical = src.includes('pons') || canonicalDex;
+  const qualified = canonical && (src.includes('pons')
     ? reserve != null && reserve >= QUALIFIED_PONS_MIN_RESERVE_USD
-    : liq != null && liq >= QUALIFIED_DEX_MIN_LIQUIDITY_USD;
+    : liq != null && liq >= QUALIFIED_DEX_MIN_LIQUIDITY_USD);
   db.prepare(`
     INSERT INTO signal_outcome_ticks
-      (event_key,token_address,sample_at,price_usd,market_cap,liquidity_usd,reserve_usd,pool_key,qualified,source,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      (event_key,token_address,sample_at,price_usd,market_cap,liquidity_usd,reserve_usd,pool_key,canonical,qualified,source,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(event_key,sample_at) DO UPDATE SET
       price_usd=excluded.price_usd,
       market_cap=COALESCE(excluded.market_cap, signal_outcome_ticks.market_cap),
       liquidity_usd=COALESCE(excluded.liquidity_usd, signal_outcome_ticks.liquidity_usd),
       reserve_usd=COALESCE(excluded.reserve_usd, signal_outcome_ticks.reserve_usd),
       pool_key=CASE WHEN excluded.pool_key<>'' THEN excluded.pool_key ELSE signal_outcome_ticks.pool_key END,
+      canonical=excluded.canonical,
       qualified=excluded.qualified,
       source=CASE WHEN excluded.source<>'' THEN excluded.source ELSE signal_outcome_ticks.source END
-  `).run(eventKey, tokenAddress.toLowerCase(), at, price, num(marketCap), liq, reserve, text(poolKey).toLowerCase(), qualified ? 1 : 0, text(source), at);
+  `).run(eventKey, token, at, price, num(marketCap), liq, reserve, pool, canonical ? 1 : 0, qualified ? 1 : 0, text(source), at);
   db.prepare(`
     UPDATE signal_outcomes
     SET entry_price_usd=COALESCE(entry_price_usd,?),
@@ -224,7 +258,7 @@ export function recordOutcomeSample({ eventKey, tokenAddress, sampleAt, priceUsd
         last_sample_at=?, updated_at=?
     WHERE event_key=?
   `).run(price, num(marketCap), num(liquidityUsd), at, new Date().toISOString(), eventKey);
-  return { ok: true };
+  return { ok: true, canonical, qualified };
 }
 
 function nearestSample(samples, targetMs, toleranceMs) {
@@ -264,13 +298,14 @@ export function recomputeOutcome(eventKey, now = new Date()) {
   const entry = num(row.entry_price_usd);
   if (entry == null || entry <= 0) return row;
   const samples = db.prepare(`
-    SELECT sample_at,price_usd,market_cap,liquidity_usd,reserve_usd,pool_key,qualified
+    SELECT sample_at,price_usd,market_cap,liquidity_usd,reserve_usd,pool_key,canonical,qualified
     FROM signal_outcome_ticks
     WHERE event_key=? AND price_usd>0
     ORDER BY sample_at ASC
   `).all(eventKey);
   if (!samples.length) return row;
 
+  const canonicalSamples = samples.filter(s => Number(s.canonical || 0) === 1);
   const qualifiedSamples = samples.filter(s => Number(s.qualified || 0) === 1);
   let rawMaxPrice = entry;
   let maxPrice = entry;
@@ -279,8 +314,11 @@ export function recomputeOutcome(eventKey, now = new Date()) {
   let maxDrawdown = 0;
   for (const s of samples) {
     const p = num(s.price_usd);
+    if (p != null) rawMaxPrice = Math.max(rawMaxPrice, p);
+  }
+  for (const s of canonicalSamples) {
+    const p = num(s.price_usd);
     if (p == null) continue;
-    rawMaxPrice = Math.max(rawMaxPrice, p);
     minPrice = Math.min(minPrice, p);
     peak = Math.max(peak, p);
     if (peak > 0) maxDrawdown = Math.min(maxDrawdown, ((p / peak) - 1) * 100);
@@ -293,20 +331,20 @@ export function recomputeOutcome(eventKey, now = new Date()) {
   const values = {};
   for (const m of MILESTONES) {
     const target = triggeredMs + m.ms;
-    const sample = elapsed >= m.ms ? nearestSample(samples, target, m.toleranceMs) : null;
-    values[`${m.key}_price`] = sample ? num(sample.price_usd) : row[`${m.key}_price`];
-    values[`${m.key}_return_pct`] = sample ? pct(sample.price_usd, entry) : row[`${m.key}_return_pct`];
-    values[`${m.key}_at`] = sample ? sample.sample_at : row[`${m.key}_at`];
+    const sample = elapsed >= m.ms ? nearestSample(canonicalSamples, target, m.toleranceMs) : null;
+    values[`${m.key}_price`] = sample ? num(sample.price_usd) : (elapsed < m.ms ? row[`${m.key}_price`] : null);
+    values[`${m.key}_return_pct`] = sample ? pct(sample.price_usd, entry) : (elapsed < m.ms ? row[`${m.key}_return_pct`] : null);
+    values[`${m.key}_at`] = sample ? sample.sample_at : (elapsed < m.ms ? row[`${m.key}_at`] : null);
   }
-  const first30 = row.first_30_at || firstThreshold(qualifiedSamples, entry, 30, 'up');
-  const first50 = row.first_50_at || firstThreshold(qualifiedSamples, entry, 50, 'up');
-  const first100 = row.first_100_at || firstThreshold(qualifiedSamples, entry, 100, 'up');
-  const firstMinus30 = row.first_minus30_at || firstThreshold(samples, entry, -30, 'down');
+  const first30 = firstThreshold(qualifiedSamples, entry, 30, 'up');
+  const first50 = firstThreshold(qualifiedSamples, entry, 50, 'up');
+  const first100 = firstThreshold(qualifiedSamples, entry, 100, 'up');
+  const firstMinus30 = firstThreshold(canonicalSamples, entry, -30, 'down');
   const cleanWin30 = Boolean(first30 && (!firstMinus30 || first30 < firstMinus30));
   const complete = elapsed >= 24 * 60 * 60_000 && Boolean(values.h24_at);
   const metrics = { maxRunup, maxAdverse, cleanWin30 };
   const label = outcomeLabel(metrics, complete);
-  const quality = samples.length >= 8 ? 'GOOD' : (samples.length >= 3 ? 'PARTIAL' : 'THIN');
+  const quality = canonicalSamples.length >= 8 ? 'GOOD' : (canonicalSamples.length >= 3 ? 'PARTIAL' : 'THIN');
   const updatedAt = new Date().toISOString();
 
   db.prepare(`

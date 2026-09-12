@@ -62,7 +62,7 @@ function latestFreshTick(token, shadow, now = Date.now()) {
   `).get(token, cutoff);
   if (!tick) return null;
   const raw = parsedRaw(tick.raw_data);
-  return { ...tick, reserveUsd: num(raw?.reserveUsd), raw_data: undefined };
+  return { ...tick, reserveUsd: num(raw?.reserveUsd), pairSelection: text(raw?.pairSelection), raw_data: undefined };
 }
 
 async function getMarketForGroup(rows) {
@@ -119,6 +119,7 @@ async function cycle() {
             liquidityUsd: market.liquidityUsd,
             reserveUsd: market.reserveUsd,
             poolKey: market.poolKey,
+            pairSelection: market.pairSelection,
             source: market.source || (market.cached ? 'market-ticks-cache' : 'history-probe'),
           });
           recomputeOutcome(row.event_key, new Date());

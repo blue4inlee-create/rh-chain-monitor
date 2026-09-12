@@ -8,7 +8,9 @@ import { ensureRiskSchema } from './risk.mjs';
 import { ensureStageSchema, getStageHealth } from './stages.mjs';
 import { ensureLifecycleMilestoneSchema, getLifecycleMilestoneHealth } from './lifecycle_milestones.mjs';
 
-export const RESULT_VERSION = '2.18.0';
+export const RESULT_VERSION = '2.18.1';
+const QUALIFIED_DEX_MIN_LIQUIDITY_USD = Math.max(0, Number(process.env.QUALIFIED_DEX_MIN_LIQUIDITY_USD || 10_000));
+const QUALIFIED_PONS_MIN_RESERVE_USD = Math.max(0, Number(process.env.QUALIFIED_PONS_MIN_RESERVE_USD || 2_500));
 
 function text(v) { return v == null ? '' : String(v).trim(); }
 function num(v) {
@@ -21,6 +23,7 @@ function shortJson(v, max = 500) {
   const s = text(v);
   return s.length > max ? `${s.slice(0, max)}…` : s;
 }
+function parsedRaw(v) { try { return JSON.parse(String(v || '{}')); } catch { return {}; } }
 function ratio(buys, sells) {
   const b = num(buys), s = num(sells);
   if (b == null || s == null) return '';
@@ -32,28 +35,42 @@ function minutesBetween(start, end) {
   if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return null;
   return Math.round(((b - a) / 60_000) * 100) / 100;
 }
-function canaryPathStats(ticks, entryPrice, canaryAt) {
+function canaryPathStats(ticks, entryPrice, canaryAt, canonicalPool = '') {
   const entry = num(entryPrice);
   if (!(entry > 0)) return { maxDrawdown: null, time2x: null, time5x: null, time10x: null };
-  const valid = (Array.isArray(ticks) ? ticks : [])
-    .map(r => ({ at: r.tick_at, price: num(r.price_usd) }))
-    .filter(r => r.price != null && r.price > 0);
-  if (!valid.length) return { maxDrawdown: null, time2x: null, time5x: null, time10x: null };
+  const canonicalKey = text(canonicalPool).toLowerCase();
+  const rows = (Array.isArray(ticks) ? ticks : []).filter(r => num(r.price_usd) != null && num(r.price_usd) > 0);
+  if (!rows.length) return { maxDrawdown: null, time2x: null, time5x: null, time10x: null };
 
   let peak = entry;
   let maxDrawdown = 0;
   let time2x = null;
   let time5x = null;
   let time10x = null;
-  for (const tick of valid) {
-    const multiple = tick.price / entry;
-    if (time2x == null && multiple >= 2) time2x = minutesBetween(canaryAt, tick.at);
-    if (time5x == null && multiple >= 5) time5x = minutesBetween(canaryAt, tick.at);
-    if (time10x == null && multiple >= 10) time10x = minutesBetween(canaryAt, tick.at);
-    if (tick.price > peak) peak = tick.price;
-    if (peak > 0) maxDrawdown = Math.max(maxDrawdown, (peak - tick.price) / peak);
+  let canonicalSeen = false;
+  for (const tick of rows) {
+    const price = num(tick.price_usd);
+    const source = text(tick.source).toLowerCase();
+    const pool = text(tick.pool_key).toLowerCase();
+    const raw = parsedRaw(tick.raw_data);
+    const pons = source.includes('pons');
+    const canonical = pons || text(raw?.pairSelection).toLowerCase() === 'highest_liquidity' || Boolean(canonicalKey && pool === canonicalKey);
+    if (!canonical) continue;
+    canonicalSeen = true;
+    const reserve = num(raw?.reserveUsd);
+    const qualified = pons
+      ? reserve != null && reserve >= QUALIFIED_PONS_MIN_RESERVE_USD
+      : num(tick.liquidity_usd) != null && num(tick.liquidity_usd) >= QUALIFIED_DEX_MIN_LIQUIDITY_USD;
+    const multiple = price / entry;
+    if (qualified) {
+      if (time2x == null && multiple >= 2) time2x = minutesBetween(canaryAt, tick.tick_at);
+      if (time5x == null && multiple >= 5) time5x = minutesBetween(canaryAt, tick.tick_at);
+      if (time10x == null && multiple >= 10) time10x = minutesBetween(canaryAt, tick.tick_at);
+      if (price > peak) peak = price;
+    }
+    if (peak > 0) maxDrawdown = Math.max(maxDrawdown, (peak - price) / peak);
   }
-  return { maxDrawdown, time2x, time5x, time10x };
+  return { maxDrawdown: canonicalSeen ? maxDrawdown : null, time2x, time5x, time10x };
 }
 
 function prepareLookups(db) {
@@ -66,7 +83,8 @@ function prepareLookups(db) {
     v2Score: db.prepare(`SELECT * FROM scores_v2_shadow WHERE token_address=? ORDER BY scored_at DESC, id DESC LIMIT 1`),
     stageEntry: db.prepare(`SELECT * FROM stage_history WHERE token_address=? AND to_stage='CANARY' ORDER BY changed_at ASC, id ASC LIMIT 1`),
     latestTick: db.prepare(`SELECT * FROM market_ticks WHERE token_address=? ORDER BY tick_at DESC, id DESC LIMIT 1`),
-    canaryTicks: db.prepare(`SELECT tick_at, price_usd FROM market_ticks WHERE token_address=? AND tick_at>=? AND price_usd IS NOT NULL ORDER BY tick_at ASC, id ASC`),
+    canaryTicks: db.prepare(`SELECT tick_at,price_usd,liquidity_usd,source,pool_key,raw_data FROM market_ticks WHERE token_address=? AND tick_at>=? AND price_usd IS NOT NULL ORDER BY tick_at ASC,id ASC`),
+    canonicalPool: db.prepare(`SELECT pool_key FROM market_ticks WHERE token_address=? AND lower(source)<>'pons-curve' AND pool_key<>'' AND liquidity_usd IS NOT NULL GROUP BY pool_key ORDER BY MAX(liquidity_usd) DESC,pool_key ASC LIMIT 1`),
     riskRows: db.prepare(`SELECT check_name, status, severity, value, details FROM risk_checks WHERE token_address=? AND snapshot_type=? ORDER BY severity DESC, check_name ASC`),
     snapshotNear: db.prepare(`SELECT * FROM snapshots WHERE token_address=? ORDER BY ABS(julianday(snapshot_at) - julianday(?)) ASC, id DESC LIMIT 1`),
     marlin30: hasMarlin30 ? db.prepare(`SELECT * FROM marlin_30s WHERE token_address=? LIMIT 1`) : null,
@@ -151,8 +169,9 @@ function canaryRows(db, lookup) {
       ? Number(t.current_price_usd) / Number(t.canary_price_usd) : '';
     const mechanism = text(pool.pool_version) || (/pons/i.test(text(t.first_source)) ? 'Curve' : '');
     const ticks = t.canary_at ? lookup.canaryTicks.all(t.token_address, t.canary_at) : [];
-    const path = canaryPathStats(ticks, t.canary_price_usd, t.canary_at);
-    const athMinutes = t.canary_at && t.canary_ath_at ? minutesBetween(t.canary_at, t.canary_ath_at) : null;
+    const canonicalPool = lookup.canonicalPool.get(t.token_address)?.pool_key || '';
+    const path = canaryPathStats(ticks, t.canary_price_usd, t.canary_at, canonicalPool);
+    const athMinutes = t.canary_at && t.qualified_canary_ath_at ? minutesBetween(t.canary_at, t.qualified_canary_ath_at) : null;
     const timing = [
       path.time2x != null ? `T2x=${path.time2x}m` : '',
       path.time5x != null ? `T5x=${path.time5x}m` : '',

@@ -111,6 +111,13 @@ export function deriveCandidateStatus(row = {}, cfg = DEFAULTS, atMs = Date.now(
 }
 
 function bestKnownPair(db, token) {
+  const canonical = db.prepare(`
+    SELECT pool_key FROM market_ticks
+    WHERE token_address=? AND lower(source)<>'pons-curve' AND pool_key<>'' AND liquidity_usd IS NOT NULL
+    GROUP BY pool_key
+    ORDER BY MAX(liquidity_usd) DESC, pool_key ASC LIMIT 1
+  `).get(token)?.pool_key;
+  if (text(canonical)) return lower(canonical);
   const tick = db.prepare(`
     SELECT pool_key FROM market_ticks
     WHERE token_address=? AND pool_key<>''
@@ -280,7 +287,7 @@ export async function syncSecondLegCandidates({ manualPath = '', cfg = DEFAULTS 
     manualUpserts = await withBusyRetry(() => db.transaction(() => {
       let count = 0;
       for (const row of manual) {
-        const tokenRow = db.prepare(`SELECT symbol,first_seen_at,canary_at,last_seen_at,ath_price_usd,ath_price_at,current_price_usd,current_liquidity_usd,MAX(COALESCE(max_multiple_canary,0),COALESCE(max_multiple_discovery,0)) peak_multiple,COALESCE(monitor_stage,stage,'') source_stage FROM tokens WHERE token_address=?`).get(row.token_address) || {};
+        const tokenRow = db.prepare(`SELECT symbol,first_seen_at,canary_at,last_seen_at,qualified_ath_price_usd AS ath_price_usd,qualified_ath_at AS ath_price_at,current_price_usd,current_liquidity_usd,MAX(COALESCE(qualified_max_multiple_canary,0),COALESCE(qualified_max_multiple_discovery,0)) peak_multiple,COALESCE(monitor_stage,stage,'') source_stage FROM tokens WHERE token_address=?`).get(row.token_address) || {};
         const op = db.prepare('SELECT risk_gate,risk_confidence,buy_blocked,hard_fail_count FROM opportunity_pool WHERE token_address=?').get(row.token_address) || {};
         const merged = {
           ...tokenRow,

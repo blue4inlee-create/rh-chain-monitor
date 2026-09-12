@@ -10,17 +10,19 @@ import { ensurePriceMilestoneSchema } from './price_milestones.mjs';
 import { ensureAthSchema, recordMarketTick, getAthHealth } from './ath_metrics.mjs';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
-const VERSION = '2.16.2-canonical-pair';
+const VERSION = '2.16.3-stateview-fallback';
 const CFG = {
   chainId: 4663,
   rpc: process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com',
   chain: process.env.DEXSCREENER_CHAIN_ID || 'robinhood',
   ponsFactory: process.env.PONS_V2_FACTORY || '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e',
+  v4StateView: process.env.UNIV4_STATE_VIEW || '0xf3334192d15450cdd385c8b70e03f9a6bd9e673b',
   weth: (process.env.WETH || '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73').toLowerCase(),
   cycleMs: Math.max(15_000, Number(process.env.CANARY_TRACK_CYCLE_MS || 30_000)),
   minIntervalMs: Math.max(60_000, Number(process.env.CANARY_TRACK_INTERVAL_MS || 300_000)),
   batchSize: Math.max(1, Math.min(20, Number(process.env.CANARY_TRACK_BATCH || 4))),
   rpcGapMs: Math.max(150, Number(process.env.CANARY_TRACK_RPC_GAP_MS || 300)),
+  pendingBackoffMs: Math.max(60_000, Number(process.env.CANARY_TRACK_PENDING_BACKOFF_MS || 5 * 60_000)),
   shadowEnabled: !/^(0|false|no)$/i.test(String(process.env.SHADOW_TRACK_ENABLED || 'true')),
   shadowMinScore: Math.max(0, Number(process.env.SHADOW_TRACK_MIN_SCORE || 45)),
   shadowMinAgeMs: Math.max(60_000, Number(process.env.SHADOW_TRACK_MIN_AGE_MS || 120_000)),
@@ -54,12 +56,17 @@ const curveAbi = parseAbi([
   'function getReserves() view returns (uint256 quoteReserve, uint256 tokenReserve)',
   'function realQuoteReserve() view returns (uint256)',
 ]);
+const stateViewAbi = parseAbi([
+  'function getSlot0(bytes32 poolId) view returns (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee)',
+  'function getLiquidity(bytes32 poolId) view returns (uint128 liquidity)',
+]);
 
 const quoteDecimalsCache = new Map();
 const quotePriceCache = new Map();
 let rpcTail = Promise.resolve();
 let rpcLastAt = 0;
 let stopping = false;
+const pendingUntil = new Map();
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function text(v) { return v == null ? '' : String(v).trim(); }
@@ -84,6 +91,20 @@ function parseJson(v) {
   try { return JSON.parse(String(v || '{}')); }
   catch { return {}; }
 }
+function pendingKey(label, token) { return `${label}:${text(token).toLowerCase()}`; }
+function pendingBlocked(label, token, now = Date.now()) {
+  const key = pendingKey(label, token);
+  const until = Number(pendingUntil.get(key) || 0);
+  if (!until || until <= now) {
+    pendingUntil.delete(key);
+    return false;
+  }
+  return true;
+}
+function markPending(label, token, now = Date.now()) {
+  pendingUntil.set(pendingKey(label, token), now + CFG.pendingBackoffMs);
+}
+function clearPending(label, token) { pendingUntil.delete(pendingKey(label, token)); }
 
 function scheduleRpc(fn) {
   const run = async () => {
@@ -162,6 +183,80 @@ async function quoteUsd(quote) {
   }
   if (price != null && price > 0) quotePriceCache.set(key, { price, at: Date.now() });
   return price;
+}
+
+function validPoolId(v) { return /^0x[a-fA-F0-9]{64}$/.test(text(v)); }
+
+function canonicalV4Pool(row) {
+  const db = getDatabase();
+  const canonical = db.prepare(`
+    SELECT m.pool_key,p.quote_token
+    FROM (
+      SELECT pool_key,MAX(liquidity_usd) max_liq
+      FROM market_ticks
+      WHERE token_address=? AND lower(source)<>'pons-curve'
+        AND pool_key<>'' AND liquidity_usd IS NOT NULL
+      GROUP BY pool_key
+      ORDER BY max_liq DESC,pool_key ASC LIMIT 1
+    ) m
+    LEFT JOIN pools p ON p.token_address=? AND lower(p.pool_key)=lower(m.pool_key)
+    LIMIT 1
+  `).get(row.token_address,row.token_address);
+  if (validPoolId(canonical?.pool_key)) return canonical;
+  return db.prepare(`
+    SELECT pool_key,quote_token FROM pools
+    WHERE token_address=? AND upper(pool_version)='V4'
+      AND pool_key<>''
+    ORDER BY CASE WHEN lower(pool_key)=lower(?) THEN 0 ELSE 1 END,discovered_at ASC,id ASC
+    LIMIT 1
+  `).get(row.token_address,row.first_pool_key || '') || null;
+}
+
+function slot0TokenQuotePrice(sqrtPriceX96, token, quote, tokenDecimals, quoteDecimalsValue) {
+  const sqrt = Number(sqrtPriceX96);
+  if (!(sqrt > 0) || !validAddress(token) || !validAddress(quote)) return null;
+  const raw1Per0 = (sqrt / 2 ** 96) ** 2;
+  if (!(raw1Per0 > 0) || !Number.isFinite(raw1Per0)) return null;
+  const tokenIs0 = BigInt(token.toLowerCase()) < BigInt(quote.toLowerCase());
+  if (tokenIs0) {
+    return raw1Per0 * (10 ** Number(tokenDecimals)) / (10 ** Number(quoteDecimalsValue));
+  }
+  const quotePerTokenRaw = 1 / raw1Per0;
+  return quotePerTokenRaw * (10 ** Number(tokenDecimals)) / (10 ** Number(quoteDecimalsValue));
+}
+
+async function v4StateMetrics(row) {
+  const pool = canonicalV4Pool(row);
+  if (!pool || !validPoolId(pool.pool_key) || !validAddress(pool.quote_token)) return null;
+  const [slot,activeLiquidity,qDecimals,qUsd] = await Promise.all([
+    readContract(CFG.v4StateView,stateViewAbi,'getSlot0',[pool.pool_key]),
+    readContract(CFG.v4StateView,stateViewAbi,'getLiquidity',[pool.pool_key]),
+    quoteDecimals(pool.quote_token),
+    quoteUsd(pool.quote_token),
+  ]);
+  if (!slot || qDecimals == null || !(qUsd > 0)) return null;
+  const tokenDecimals = Number.isFinite(Number(row.decimals)) ? Number(row.decimals) : 18;
+  const quotePerToken = slot0TokenQuotePrice(slot[0],row.token_address,pool.quote_token,tokenDecimals,qDecimals);
+  if (!(quotePerToken > 0) || !Number.isFinite(quotePerToken)) return null;
+  const priceUsd = quotePerToken * qUsd;
+  let marketCap = null;
+  if (row.total_supply) {
+    try {
+      const supply = Number(formatUnits(BigInt(row.total_supply),tokenDecimals));
+      if (Number.isFinite(supply)) marketCap = priceUsd * supply;
+    } catch {}
+  }
+  return {
+    priceUsd,marketCap,liquidityUsd:0,buyCount5m:null,sellCount5m:null,volume5m:null,
+    source:'uniswap-v4-stateview',poolKey:text(pool.pool_key).toLowerCase(),
+    reserveUsd:null,curveProgressPct:null,phase:null,
+    raw:{
+      pairSelection:'stateview_canonical_pool',fallback:true,stateView:CFG.v4StateView,
+      sqrtPriceX96:slot[0].toString(),tick:Number(slot[1]),protocolFee:Number(slot[2]),lpFee:Number(slot[3]),
+      quoteToken:text(pool.quote_token).toLowerCase(),quoteUsd:qUsd,
+      activeLiquidity:activeLiquidity == null ? null : activeLiquidity.toString(),liquidityUsdStatus:'unknown_conservative_zero',
+    },
+  };
 }
 
 async function ponsMetrics(row) {
@@ -244,7 +339,9 @@ async function marketMetrics(row) {
       },
     };
   }
-  return ponsMetrics(row);
+  const pons = await ponsMetrics(row);
+  if (pons) return pons;
+  return v4StateMetrics(row);
 }
 
 function ensureMarlinSchema() {
@@ -298,7 +395,9 @@ function dueCanaries() {
       CASE WHEN last_tick_at IS NULL THEN t.canary_at END DESC,
       last_tick_at ASC
     LIMIT ?
-  `).all(cutoff, CFG.batchSize);
+  `).all(cutoff, Math.max(100, CFG.batchSize * 20))
+    .filter(row => !pendingBlocked('canary', row.token_address))
+    .slice(0, CFG.batchSize);
 }
 
 function dueShadows() {
@@ -338,7 +437,9 @@ function dueShadows() {
       CASE WHEN last_tick_at IS NULL THEN t.first_seen_at END DESC,
       last_tick_at ASC
     LIMIT ?
-  `).all(oldest, newest, CFG.shadowMinScore, cutoff, CFG.shadowBatchSize);
+  `).all(oldest, newest, CFG.shadowMinScore, cutoff, Math.max(100, CFG.shadowBatchSize * 20))
+    .filter(row => !pendingBlocked('shadow', row.token_address))
+    .slice(0, CFG.shadowBatchSize);
 }
 
 function dueMarlinWindows() {
@@ -382,9 +483,15 @@ async function trackRows(rows, label) {
     if (stopping) return;
     const metrics = await marketMetrics(row);
     if (!metrics) {
-      console.log(`[${label} tick pending]`, JSON.stringify({ token: row.token_address, score: row.latest_score ?? null }));
+      markPending(label, row.token_address);
+      console.log(`[${label} tick pending]`, JSON.stringify({
+        token: row.token_address,
+        score: row.latest_score ?? null,
+        retryAfterSec: Math.round(CFG.pendingBackoffMs / 1000),
+      }));
       continue;
     }
+    clearPending(label, row.token_address);
     const result = recordMarketTick({
       tokenAddress: row.token_address,
       poolKey: metrics.poolKey,
@@ -523,6 +630,8 @@ async function main() {
     minIntervalMs: CFG.minIntervalMs,
     batchSize: CFG.batchSize,
     rpcGapMs: CFG.rpcGapMs,
+    pendingBackoffMs: CFG.pendingBackoffMs,
+    v4StateView: CFG.v4StateView,
     shadow: {
       enabled: CFG.shadowEnabled,
       minScore: CFG.shadowMinScore,

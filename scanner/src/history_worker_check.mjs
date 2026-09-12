@@ -53,7 +53,9 @@ try {
     ) VALUES (?,?,?,?,?,?,?,?,?)
   `).run(token, 'TEST', t0, t0, 'test', 'CANARY', '{}', t0, t0);
 
-  recordMarketTick({ tokenAddress: token, tickAt: t0, priceUsd: 1, marketCap: 100000, liquidityUsd: 25000, source: 'test' });
+  const canonicalPool = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const alternatePool = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  recordMarketTick({ tokenAddress: token, poolKey: canonicalPool, tickAt: t0, priceUsd: 1, marketCap: 100000, liquidityUsd: 25000, source: 'uniswap', raw: { pairSelection: 'highest_liquidity' } });
   db.prepare(`
     INSERT INTO alert_events
       (event_key,event_type,token_address,symbol,score,confidence,liquidity,risk_gate,triggered_at,bark_status,telegram_status)
@@ -76,17 +78,50 @@ try {
       priceUsd: price,
       marketCap: price * 100000,
       liquidityUsd: 25000,
-      source: 'test',
+      poolKey: canonicalPool,
+      source: 'uniswap',
     });
   }
+  recordOutcomeSample({
+    eventKey: `${token}|EARLY_ALPHA|${t0}`,
+    tokenAddress: token,
+    sampleAt: iso(t0, 30 * 60_000),
+    priceUsd: 10,
+    marketCap: 1000000,
+    liquidityUsd: 15000,
+    poolKey: alternatePool,
+    source: 'uniswap',
+  });
+  const alternate = db.prepare('SELECT canonical,qualified FROM signal_outcome_ticks WHERE event_key=? AND sample_at=?').get(`${token}|EARLY_ALPHA|${t0}`, iso(t0, 30 * 60_000));
+  assert(Number(alternate?.canonical) === 0, 'alternate pool sample must not be canonical');
+  assert(Number(alternate?.qualified) === 0, 'alternate pool sample must not qualify');
+
+  recordOutcomeSample({
+    eventKey: `${token}|EARLY_ALPHA|${t0}`,
+    tokenAddress: token,
+    sampleAt: iso(t0, 2 * 60 * 60_000),
+    priceUsd: 0.50,
+    marketCap: 50000,
+    liquidityUsd: 5000,
+    poolKey: canonicalPool,
+    source: 'uniswap',
+  });
+  const thinCanonical = db.prepare('SELECT canonical,qualified FROM signal_outcome_ticks WHERE event_key=? AND sample_at=?').get(`${token}|EARLY_ALPHA|${t0}`, iso(t0, 2 * 60 * 60_000));
+  assert(Number(thinCanonical?.canonical) === 1, 'main-pool thin sample should remain canonical');
+  assert(Number(thinCanonical?.qualified) === 0, 'thin main-pool sample must not count as a positive qualified hit');
+
   const row = recomputeOutcome(`${token}|EARLY_ALPHA|${t0}`, new Date(iso(t0, 24 * 60 * 60_000 + 60_000)));
   assert(row.status === 'COMPLETE', 'outcome should complete after 24h sample');
   assert(Math.abs(Number(row.m15_return_pct) - 40) < 0.001, '15m return mismatch');
   assert(Math.abs(Number(row.h1_return_pct) - 60) < 0.001, '1h return mismatch');
   assert(Math.abs(Number(row.h24_return_pct) - 110) < 0.001, '24h return mismatch');
   assert(Number(row.hit_100) === 1, 'expected +100 hit');
+  assert(Math.abs(Number(row.raw_max_multiple) - 10) < 0.001, 'raw max should retain alternate-pool spike');
+  assert(Math.abs(Number(row.max_multiple) - 2.1) < 0.001, 'qualified max must ignore alternate-pool spike');
   assert(Number(row.clean_win_30) === 1, 'expected clean +30 before -30');
-  assert(Number(row.max_drawdown_pct) <= -49.9, 'expected peak-to-trough drawdown');
+  assert(Number(row.hit_minus30) === 1, 'thin canonical downside must still count as risk');
+  assert(Number(row.max_adverse_pct) <= -49.9, 'expected canonical downside to be retained');
+  assert(Number(row.max_drawdown_pct) <= -68.7, 'expected canonical peak-to-trough drawdown');
   assert(row.outcome_label === 'MULTIBAGGER', 'expected multibagger label');
   const calibration = getHistoryCalibrationRows();
   assert(calibration.some(x => x.dimension === 'Score' && x.bucket === '85+'), 'score calibration bucket missing');
