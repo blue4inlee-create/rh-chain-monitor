@@ -5,6 +5,7 @@ let runner = null;
 let shadow = null;
 let opportunityWorker = null;
 let alertWorker = null;
+let secondLegWorker = null;
 let shadowThresholdWorker = null;
 let historyWorker = null;
 let historyExport = null;
@@ -21,68 +22,25 @@ function start(file, label, extraEnv = {}) {
   return child;
 }
 
-function startShadow() {
-  if (stopping) return;
-  shadow = start('./fast_m30_shadow.mjs', 'fast-m30', {
-    RH_HTTP_URL: process.env.FAST_M30_RPC_URL || process.env.RH_HTTP_URL,
-  });
-  shadow.on('exit', (code, signal) => {
+function restartable(refSetter, file, label, extraEnv = {}) {
+  if (stopping) return null;
+  const child = start(file, label, extraEnv);
+  refSetter(child);
+  child.on('exit', (code, signal) => {
     if (stopping) return;
-    console.error(`[shadow-supervisor fast-m30] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
-    setTimeout(startShadow, 5000).unref();
+    console.error(`[shadow-supervisor ${label}] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
+    setTimeout(() => restartable(refSetter, file, label, extraEnv), 5000).unref();
   });
+  return child;
 }
 
-function startOpportunityWorker() {
-  if (stopping) return;
-  opportunityWorker = start('./opportunity_worker.mjs', 'opportunity-worker');
-  opportunityWorker.on('exit', (code, signal) => {
-    if (stopping) return;
-    console.error(`[shadow-supervisor opportunity-worker] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
-    setTimeout(startOpportunityWorker, 5000).unref();
-  });
-}
-
-function startAlertWorker() {
-  if (stopping) return;
-  alertWorker = start('./alert_worker.mjs', 'alert-worker');
-  alertWorker.on('exit', (code, signal) => {
-    if (stopping) return;
-    console.error(`[shadow-supervisor alert-worker] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
-    setTimeout(startAlertWorker, 5000).unref();
-  });
-}
-
-function startShadowThresholdWorker() {
-  if (stopping) return;
-  shadowThresholdWorker = start('./shadow_threshold_worker.mjs', 'shadow-threshold-worker');
-  shadowThresholdWorker.on('exit', (code, signal) => {
-    if (stopping) return;
-    console.error(`[shadow-supervisor shadow-threshold-worker] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
-    setTimeout(startShadowThresholdWorker, 5000).unref();
-  });
-}
-
-function startHistoryWorker() {
-  if (stopping) return;
-  historyWorker = start('./history_worker.mjs', 'history-worker');
-  historyWorker.on('exit', (code, signal) => {
-    if (stopping) return;
-    console.error(`[shadow-supervisor history-worker] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
-    setTimeout(startHistoryWorker, 5000).unref();
-  });
-}
-
-function startHistoryExport() {
-  if (stopping) return;
-  historyExport = start('./history_export_server.mjs', 'history-export');
-  historyExport.on('exit', (code, signal) => {
-    if (stopping) return;
-    console.error(`[shadow-supervisor history-export] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
-    setTimeout(startHistoryExport, 5000).unref();
-  });
-}
-
+function startShadow() { return restartable(x => { shadow = x; }, './fast_m30_shadow.mjs', 'fast-m30', { RH_HTTP_URL: process.env.FAST_M30_RPC_URL || process.env.RH_HTTP_URL }); }
+function startOpportunityWorker() { return restartable(x => { opportunityWorker = x; }, './opportunity_worker.mjs', 'opportunity-worker'); }
+function startAlertWorker() { return restartable(x => { alertWorker = x; }, './alert_worker.mjs', 'alert-worker'); }
+function startSecondLegWorker() { return restartable(x => { secondLegWorker = x; }, './second_leg_alert_worker.mjs', 'second-leg-alert-worker'); }
+function startShadowThresholdWorker() { return restartable(x => { shadowThresholdWorker = x; }, './shadow_threshold_worker.mjs', 'shadow-threshold-worker'); }
+function startHistoryWorker() { return restartable(x => { historyWorker = x; }, './history_worker.mjs', 'history-worker'); }
+function startHistoryExport() { return restartable(x => { historyExport = x; }, './history_export_server.mjs', 'history-export'); }
 function startStorageMaintenance() {
   if (stopping) return;
   storageMaintenance = start('./storage_maintenance.mjs', 'storage-maintenance');
@@ -92,7 +50,6 @@ function startStorageMaintenance() {
     setTimeout(startStorageMaintenance, 10000).unref();
   });
 }
-
 function startCompareReport() {
   if (stopping || (compareReport && compareReport.exitCode == null && !compareReport.killed)) return;
   compareReport = start('./fast_m30_compare_report.mjs', 'fast-compare');
@@ -101,26 +58,19 @@ function startCompareReport() {
     compareReport = null;
   });
 }
-
+function kill(child, signal) { if (child && !child.killed) child.kill(signal); }
 function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   if (compareTimer) clearInterval(compareTimer);
-  if (compareReport && !compareReport.killed) compareReport.kill(signal);
-  if (storageMaintenance && !storageMaintenance.killed) storageMaintenance.kill(signal);
-  if (historyExport && !historyExport.killed) historyExport.kill(signal);
-  if (historyWorker && !historyWorker.killed) historyWorker.kill(signal);
-  if (shadowThresholdWorker && !shadowThresholdWorker.killed) shadowThresholdWorker.kill(signal);
-  if (alertWorker && !alertWorker.killed) alertWorker.kill(signal);
-  if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill(signal);
-  if (shadow && !shadow.killed) shadow.kill(signal);
-  if (runner && !runner.killed) runner.kill(signal);
+  for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, alertWorker, opportunityWorker, shadow, runner]) kill(child, signal);
 }
 
 runner = start('./runner.mjs', 'runner');
 startShadow();
 startOpportunityWorker();
 startAlertWorker();
+startSecondLegWorker();
 startShadowThresholdWorker();
 startHistoryWorker();
 startHistoryExport();
@@ -133,14 +83,7 @@ runner.on('exit', (code, signal) => {
   if (!stopping) {
     stopping = true;
     if (compareTimer) clearInterval(compareTimer);
-    if (compareReport && !compareReport.killed) compareReport.kill('SIGTERM');
-    if (storageMaintenance && !storageMaintenance.killed) storageMaintenance.kill('SIGTERM');
-    if (historyExport && !historyExport.killed) historyExport.kill('SIGTERM');
-    if (historyWorker && !historyWorker.killed) historyWorker.kill('SIGTERM');
-    if (shadowThresholdWorker && !shadowThresholdWorker.killed) shadowThresholdWorker.kill('SIGTERM');
-    if (alertWorker && !alertWorker.killed) alertWorker.kill('SIGTERM');
-    if (opportunityWorker && !opportunityWorker.killed) opportunityWorker.kill('SIGTERM');
-    if (shadow && !shadow.killed) shadow.kill('SIGTERM');
+    for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, alertWorker, opportunityWorker, shadow]) kill(child, 'SIGTERM');
   }
   console.error(`[shadow-supervisor runner] exited code=${code ?? ''} signal=${signal || ''}`);
   process.exitCode = Number.isInteger(code) ? code : 1;
