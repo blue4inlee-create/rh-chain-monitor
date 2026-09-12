@@ -25,6 +25,7 @@ fi
 
 git pull --ff-only origin main
 npm --prefix scanner run check
+npm --prefix scanner run health-check
 
 cat > "$UNIT_FILE" <<EOF
 [Unit]
@@ -44,6 +45,10 @@ Environment=HEALTH_RESTART_COOLDOWN_MS=600000
 Environment=HEALTH_DISK_WARN_PCT=80
 Environment=HEALTH_DISK_CRITICAL_PCT=92
 Environment=HEALTH_OPPORTUNITY_STALE_MS=180000
+Environment=HEALTH_HTTP_TIMEOUT_MS=6500
+Environment=HEALTH_OPPORTUNITY_HTTP_TIMEOUT_MS=12000
+Environment=HEALTH_HTTPS_FAIL_CONFIRMATIONS=2
+Environment=HEALTH_HTTPS_RECOVERY_CONFIRMATIONS=2
 EnvironmentFile=$ALERT_ENV
 ExecStart=$NODE_BIN $MONITOR
 Restart=always
@@ -80,6 +85,7 @@ print('health status ok=',j.get('ok'))
 print('incidents=',[x.get('key') for x in j.get('incidents',[])])
 print('diskPct=',round((j.get('checks',{}).get('disk',{}).get('usedPct') or 0),1))
 print('opportunityAgeSec=',j.get('checks',{}).get('db',{}).get('opportunityAgeSec'))
+print('httpsRoutes=',{k:{'incident':v.get('incident'),'failures':v.get('failures'),'successes':v.get('successes')} for k,v in j.get('httpsRoutes',{}).items()})
 PY
 fi
 
