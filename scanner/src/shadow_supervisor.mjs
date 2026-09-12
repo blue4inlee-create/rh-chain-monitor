@@ -11,6 +11,7 @@ let shadowThresholdWorker = null;
 let historyWorker = null;
 let historyExport = null;
 let storageMaintenance = null;
+let poolDivergenceWorker = null;
 let compareReport = null;
 let compareTimer = null;
 const startupTimers = [];
@@ -58,6 +59,7 @@ function startSecondLegWorker() {
 function startShadowThresholdWorker() { return restartable(x => { shadowThresholdWorker = x; }, './shadow_threshold_worker.mjs', 'shadow-threshold-worker'); }
 function startHistoryWorker() { return restartable(x => { historyWorker = x; }, './history_worker.mjs', 'history-worker'); }
 function startHistoryExport() { return restartable(x => { historyExport = x; }, './history_export_server.mjs', 'history-export'); }
+function startPoolDivergenceWorker() { return restartable(x => { poolDivergenceWorker = x; }, './pool_divergence_worker.mjs', 'pool-divergence-worker'); }
 function startStorageMaintenance() {
   if (stopping) return;
   // The package boot probe intentionally runs storage maintenance once before the
@@ -86,7 +88,7 @@ function shutdown(signal) {
   stopping = true;
   if (compareTimer) clearInterval(compareTimer);
   clearStartupTimers();
-  for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, secondLegCandidateWorker, alertWorker, opportunityWorker, shadow, runner]) kill(child, signal);
+  for (const child of [compareReport, poolDivergenceWorker, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, secondLegCandidateWorker, alertWorker, opportunityWorker, shadow, runner]) kill(child, signal);
 }
 
 // The runner owns the core scanner and performs the heaviest SQLite schema boot work.
@@ -103,6 +105,7 @@ schedule(startStorageMaintenance, 15000, 'storage-maintenance');
 schedule(startSecondLegCandidateWorker, 17000, 'second-leg-candidate-worker');
 schedule(startSecondLegWorker, 21000, 'second-leg-alert-worker');
 schedule(startCompareReport, 25000, 'fast-compare');
+schedule(startPoolDivergenceWorker, 29000, 'pool-divergence-worker');
 compareTimer = setInterval(startCompareReport, 300000);
 compareTimer.unref();
 
@@ -111,7 +114,7 @@ runner.on('exit', (code, signal) => {
     stopping = true;
     if (compareTimer) clearInterval(compareTimer);
     clearStartupTimers();
-    for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, secondLegCandidateWorker, alertWorker, opportunityWorker, shadow]) kill(child, 'SIGTERM');
+    for (const child of [compareReport, poolDivergenceWorker, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, secondLegCandidateWorker, alertWorker, opportunityWorker, shadow]) kill(child, 'SIGTERM');
   }
   console.error(`[shadow-supervisor runner] exited code=${code ?? ''} signal=${signal || ''}`);
   process.exitCode = Number.isInteger(code) ? code : 1;
