@@ -60,11 +60,15 @@ function startHistoryWorker() { return restartable(x => { historyWorker = x; }, 
 function startHistoryExport() { return restartable(x => { historyExport = x; }, './history_export_server.mjs', 'history-export'); }
 function startStorageMaintenance() {
   if (stopping) return;
-  storageMaintenance = start('./storage_maintenance.mjs', 'storage-maintenance');
+  // The package boot probe intentionally runs storage maintenance once before the
+  // supervisor starts. Some production launchers can leave that ONCE flag in the
+  // inherited environment, so force the supervised process into long-running mode.
+  storageMaintenance = start('./storage_maintenance.mjs', 'storage-maintenance', { STORAGE_MAINTENANCE_ONCE: 'false' });
   storageMaintenance.on('exit', (code, signal) => {
     if (stopping) return;
-    console.error(`[shadow-supervisor storage-maintenance] exited code=${code ?? ''} signal=${signal || ''}; restarting`);
-    setTimeout(startStorageMaintenance, 10000).unref();
+    const delayMs = code === 0 ? 60_000 : 10_000;
+    console.error(`[shadow-supervisor storage-maintenance] exited code=${code ?? ''} signal=${signal || ''}; restarting in ${delayMs}ms`);
+    setTimeout(startStorageMaintenance, delayMs).unref();
   });
 }
 function startCompareReport() {
