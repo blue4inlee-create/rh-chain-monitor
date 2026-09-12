@@ -1,5 +1,7 @@
 import { getDatabase } from './db.mjs';
 
+const MIN_BASELINE_MARKET_CAP_USD = Math.max(0, Number(process.env.BASELINE_MIN_MARKET_CAP_USD || 100));
+
 function hasColumn(db, table, column) {
   return db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column);
 }
@@ -55,10 +57,89 @@ export function ensureAthSchema() {
       ON market_ticks(token_address, tick_at DESC);
   `);
 
-  backfillAthFromSnapshots(db);
   const current = Number(db.pragma('user_version', { simple: true }) || 0);
-  if (current < 9) db.pragma('user_version = 9');
+  if (current < 13) {
+    repairCorruptAth(db);
+    db.pragma('user_version = 13');
+  }
+  backfillAthFromSnapshots(db);
   return getAthHealth();
+}
+
+function repairCorruptAth(db) {
+  db.exec(`
+    UPDATE tokens
+    SET current_price_usd = (
+          SELECT s.price_usd FROM snapshots s
+          WHERE s.token_address=tokens.token_address
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+          ORDER BY s.snapshot_at DESC, s.id DESC LIMIT 1
+        ),
+        current_market_cap = (
+          SELECT s.market_cap FROM snapshots s
+          WHERE s.token_address=tokens.token_address
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+          ORDER BY s.snapshot_at DESC, s.id DESC LIMIT 1
+        ),
+        current_liquidity_usd = (
+          SELECT s.liquidity_usd FROM snapshots s
+          WHERE s.token_address=tokens.token_address
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+          ORDER BY s.snapshot_at DESC, s.id DESC LIMIT 1
+        ),
+        current_price_at = (
+          SELECT s.snapshot_at FROM snapshots s
+          WHERE s.token_address=tokens.token_address
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+          ORDER BY s.snapshot_at DESC, s.id DESC LIMIT 1
+        ),
+        ath_price_usd = (
+          SELECT MAX(s.price_usd) FROM snapshots s
+          WHERE s.token_address=tokens.token_address
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+        ),
+        ath_price_at = (
+          SELECT s.snapshot_at FROM snapshots s
+          WHERE s.token_address=tokens.token_address
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+          ORDER BY s.price_usd DESC, s.snapshot_at ASC, s.id ASC LIMIT 1
+        ),
+        ath_market_cap = (
+          SELECT MAX(s.market_cap) FROM snapshots s
+          WHERE s.token_address=tokens.token_address
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+        ),
+        ath_market_cap_at = (
+          SELECT s.snapshot_at FROM snapshots s
+          WHERE s.token_address=tokens.token_address
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+          ORDER BY s.market_cap DESC, s.snapshot_at ASC, s.id ASC LIMIT 1
+        ),
+        canary_ath_price_usd = CASE WHEN canary_at IS NOT NULL THEN (
+          SELECT MAX(s.price_usd) FROM snapshots s
+          WHERE s.token_address=tokens.token_address AND s.snapshot_at >= tokens.canary_at
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+        ) ELSE NULL END,
+        canary_ath_at = CASE WHEN canary_at IS NOT NULL THEN (
+          SELECT s.snapshot_at FROM snapshots s
+          WHERE s.token_address=tokens.token_address AND s.snapshot_at >= tokens.canary_at
+            AND s.price_usd IS NOT NULL AND s.price_usd > 0
+            AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+          ORDER BY s.price_usd DESC, s.snapshot_at ASC, s.id ASC LIMIT 1
+        ) ELSE NULL END
+    WHERE max_multiple_discovery > 10000
+       OR max_multiple_canary > 10000
+       OR ath_price_usd > 1000000000;
+  `);
 }
 
 function backfillAthFromSnapshots(db) {
@@ -66,7 +147,8 @@ function backfillAthFromSnapshots(db) {
     UPDATE tokens
     SET current_price_usd = COALESCE(current_price_usd,
           (SELECT s.price_usd FROM snapshots s
-           WHERE s.token_address=tokens.token_address AND s.price_usd IS NOT NULL
+           WHERE s.token_address=tokens.token_address AND s.price_usd IS NOT NULL AND s.price_usd > 0
+             AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
            ORDER BY s.snapshot_at DESC, s.id DESC LIMIT 1)),
         current_market_cap = COALESCE(current_market_cap,
           (SELECT s.market_cap FROM snapshots s
@@ -79,14 +161,18 @@ function backfillAthFromSnapshots(db) {
         current_price_at = COALESCE(current_price_at,
           (SELECT s.snapshot_at FROM snapshots s
            WHERE s.token_address=tokens.token_address
-             AND (s.price_usd IS NOT NULL OR s.market_cap IS NOT NULL)
+             AND s.price_usd IS NOT NULL AND s.price_usd > 0
+             AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
            ORDER BY s.snapshot_at DESC, s.id DESC LIMIT 1)),
         ath_price_usd = COALESCE(ath_price_usd,
           (SELECT MAX(s.price_usd) FROM snapshots s
-           WHERE s.token_address=tokens.token_address AND s.price_usd IS NOT NULL)),
+           WHERE s.token_address=tokens.token_address AND s.price_usd IS NOT NULL AND s.price_usd > 0
+             AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD})),
         ath_market_cap = COALESCE(ath_market_cap,
           (SELECT MAX(s.market_cap) FROM snapshots s
-           WHERE s.token_address=tokens.token_address AND s.market_cap IS NOT NULL))
+           WHERE s.token_address=tokens.token_address AND s.market_cap IS NOT NULL
+             AND s.price_usd IS NOT NULL AND s.price_usd > 0
+             AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}))
     WHERE EXISTS (SELECT 1 FROM snapshots s WHERE s.token_address=tokens.token_address);
 
     UPDATE tokens
@@ -99,9 +185,11 @@ function backfillAthFromSnapshots(db) {
            WHERE s.token_address=tokens.token_address AND s.market_cap=ath_market_cap
            ORDER BY s.snapshot_at ASC, s.id ASC LIMIT 1)),
         max_multiple_discovery = CASE
-          WHEN discovery_price_usd > 0 AND ath_price_usd IS NOT NULL
-            THEN MAX(COALESCE(max_multiple_discovery, 0), ath_price_usd / discovery_price_usd)
-          ELSE max_multiple_discovery END;
+          WHEN discovery_price_usd > 0
+            AND discovery_market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+            AND ath_price_usd IS NOT NULL
+            THEN ath_price_usd / discovery_price_usd
+          ELSE NULL END;
 
     UPDATE tokens
     SET canary_ath_price_usd = COALESCE(canary_ath_price_usd,
@@ -109,7 +197,8 @@ function backfillAthFromSnapshots(db) {
            WHERE s.token_address=tokens.token_address
              AND tokens.canary_at IS NOT NULL
              AND s.snapshot_at >= tokens.canary_at
-             AND s.price_usd IS NOT NULL))
+             AND s.price_usd IS NOT NULL AND s.price_usd > 0
+             AND s.market_cap IS NOT NULL AND s.market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}))
     WHERE canary_at IS NOT NULL;
 
     UPDATE tokens
@@ -122,9 +211,11 @@ function backfillAthFromSnapshots(db) {
            ORDER BY s.snapshot_at ASC, s.id ASC LIMIT 1),
           canary_at),
         max_multiple_canary = CASE
-          WHEN canary_price_usd > 0 AND COALESCE(canary_ath_price_usd, canary_price_usd) IS NOT NULL
-            THEN MAX(COALESCE(max_multiple_canary, 0), COALESCE(canary_ath_price_usd, canary_price_usd) / canary_price_usd)
-          ELSE max_multiple_canary END
+          WHEN canary_price_usd > 0
+            AND canary_market_cap >= ${MIN_BASELINE_MARKET_CAP_USD}
+            AND COALESCE(canary_ath_price_usd, canary_price_usd) IS NOT NULL
+            THEN COALESCE(canary_ath_price_usd, canary_price_usd) / canary_price_usd
+          ELSE NULL END
     WHERE canary_at IS NOT NULL;
   `);
 }
@@ -175,7 +266,8 @@ export function recordMarketTick(data = {}) {
     `).run(row);
 
     const tokenRow = db.prepare(`
-      SELECT discovery_price_usd, canary_price_usd, canary_at,
+      SELECT discovery_price_usd, discovery_market_cap,
+             canary_price_usd, canary_market_cap, canary_at,
              ath_price_usd, ath_market_cap, canary_ath_price_usd,
              max_multiple_discovery, max_multiple_canary
       FROM tokens WHERE token_address=?
@@ -184,21 +276,30 @@ export function recordMarketTick(data = {}) {
 
     const price = row.price_usd;
     const mc = row.market_cap;
+    const trustedPrice = price != null && price > 0
+      && mc != null && mc >= MIN_BASELINE_MARKET_CAP_USD;
+    const trustedValue = trustedPrice ? price : null;
+    const trustedMarketCap = trustedPrice ? mc : null;
+    const trustedLiquidity = trustedPrice ? row.liquidity_usd : null;
     const afterCanary = tokenRow.canary_at && at >= tokenRow.canary_at;
-    const newAthPrice = price != null && (tokenRow.ath_price_usd == null || price > tokenRow.ath_price_usd);
-    const newAthMc = mc != null && (tokenRow.ath_market_cap == null || mc > tokenRow.ath_market_cap);
-    const newCanaryAth = afterCanary && price != null && (tokenRow.canary_ath_price_usd == null || price > tokenRow.canary_ath_price_usd);
-    const discoveryMultiple = price != null && Number(tokenRow.discovery_price_usd) > 0
-      ? price / Number(tokenRow.discovery_price_usd) : null;
-    const canaryMultiple = afterCanary && price != null && Number(tokenRow.canary_price_usd) > 0
-      ? price / Number(tokenRow.canary_price_usd) : null;
+    const newAthPrice = trustedValue != null && (tokenRow.ath_price_usd == null || trustedValue > tokenRow.ath_price_usd);
+    const newAthMc = trustedMarketCap != null && (tokenRow.ath_market_cap == null || trustedMarketCap > tokenRow.ath_market_cap);
+    const newCanaryAth = afterCanary && trustedValue != null && (tokenRow.canary_ath_price_usd == null || trustedValue > tokenRow.canary_ath_price_usd);
+    const discoveryMultiple = trustedValue != null
+      && Number(tokenRow.discovery_price_usd) > 0
+      && Number(tokenRow.discovery_market_cap) >= MIN_BASELINE_MARKET_CAP_USD
+      ? trustedValue / Number(tokenRow.discovery_price_usd) : null;
+    const canaryMultiple = afterCanary && trustedValue != null
+      && Number(tokenRow.canary_price_usd) > 0
+      && Number(tokenRow.canary_market_cap) >= MIN_BASELINE_MARKET_CAP_USD
+      ? trustedValue / Number(tokenRow.canary_price_usd) : null;
 
     db.prepare(`
       UPDATE tokens SET
         current_price_usd=COALESCE(?, current_price_usd),
         current_market_cap=COALESCE(?, current_market_cap),
         current_liquidity_usd=COALESCE(?, current_liquidity_usd),
-        current_price_at=?,
+        current_price_at=COALESCE(?, current_price_at),
         ath_price_usd=CASE WHEN ? THEN ? ELSE ath_price_usd END,
         ath_price_at=CASE WHEN ? THEN ? ELSE ath_price_at END,
         ath_market_cap=CASE WHEN ? THEN ? ELSE ath_market_cap END,
@@ -214,10 +315,10 @@ export function recordMarketTick(data = {}) {
         updated_at=?
       WHERE token_address=?
     `).run(
-      price, mc, row.liquidity_usd, at,
-      newAthPrice ? 1 : 0, price, newAthPrice ? 1 : 0, at,
-      newAthMc ? 1 : 0, mc, newAthMc ? 1 : 0, at,
-      newCanaryAth ? 1 : 0, price, newCanaryAth ? 1 : 0, at,
+      trustedValue, trustedMarketCap, trustedLiquidity, trustedPrice ? at : null,
+      newAthPrice ? 1 : 0, trustedValue, newAthPrice ? 1 : 0, at,
+      newAthMc ? 1 : 0, trustedMarketCap, newAthMc ? 1 : 0, at,
+      newCanaryAth ? 1 : 0, trustedValue, newCanaryAth ? 1 : 0, at,
       discoveryMultiple, discoveryMultiple,
       canaryMultiple, canaryMultiple,
       at, token,
