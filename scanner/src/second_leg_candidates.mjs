@@ -12,6 +12,11 @@ const DEFAULTS = {
   maxScanCandidates: Math.max(6, Math.min(100, Number(process.env.SECOND_LEG_MAX_CANDIDATES || 40))),
 };
 
+const WRITE_CHUNK_SIZE = Math.max(10, Math.min(100, Number(process.env.SECOND_LEG_CANDIDATE_WRITE_CHUNK || 25)));
+const BUSY_RETRIES = Math.max(1, Math.min(8, Number(process.env.SECOND_LEG_CANDIDATE_BUSY_RETRIES || 4)));
+const BUSY_RETRY_MS = Math.max(50, Number(process.env.SECOND_LEG_CANDIDATE_BUSY_RETRY_MS || 250));
+let schemaReady = false;
+
 const text = v => v == null ? '' : String(v).trim();
 const lower = v => text(v).toLowerCase();
 const num = v => {
@@ -21,8 +26,24 @@ const num = v => {
 };
 const validAddress = v => /^0x[a-f0-9]{40}$/.test(lower(v));
 const nowIso = () => new Date().toISOString();
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const isBusy = err => /SQLITE_(BUSY|LOCKED)|database is locked/i.test(text(err?.code || err?.message || err));
+
+async function withBusyRetry(fn) {
+  let last = null;
+  for (let attempt = 0; attempt <= BUSY_RETRIES; attempt++) {
+    try { return fn(); }
+    catch (err) {
+      last = err;
+      if (!isBusy(err) || attempt >= BUSY_RETRIES) throw err;
+      await sleep(BUSY_RETRY_MS * (attempt + 1));
+    }
+  }
+  throw last;
+}
 
 export function ensureSecondLegCandidateSchema() {
+  if (schemaReady) return getSecondLegCandidateHealth();
   ensurePriceMilestoneSchema();
   ensureAthSchema();
   ensureStageSchema();
@@ -60,6 +81,7 @@ export function ensureSecondLegCandidateSchema() {
     CREATE INDEX IF NOT EXISTS idx_second_leg_candidates_updated
       ON second_leg_candidates(updated_at DESC);
   `);
+  schemaReady = true;
   return getSecondLegCandidateHealth();
 }
 
@@ -230,35 +252,55 @@ export async function syncSecondLegCandidates({ manualPath = '', cfg = DEFAULTS 
   const now = nowIso();
   const automatic = autoSourceRows(db);
   const manual = await readManualOverrides(manualPath);
-  const result = db.transaction(() => {
+  const manualSet = new Set(manual.map(x => x.token_address));
+  let autoUpserts = 0;
+  let manualUpserts = 0;
+
+  await withBusyRetry(() => db.transaction(() => {
     db.prepare("UPDATE second_leg_candidates SET manual_override=0 WHERE manual_override<>0").run();
-    let autoUpserts = 0;
-    let manualUpserts = 0;
-    for (const row of automatic) {
-      const existing = db.prepare('SELECT manual_override, enabled FROM second_leg_candidates WHERE token_address=?').get(lower(row.token_address));
-      const manualStillPresent = manual.some(x => x.token_address === lower(row.token_address));
-      autoUpserts += upsertCandidate(db, { ...row, manual_override: manualStillPresent ? 1 : 0, enabled: existing?.enabled ?? 1 }, manualStillPresent ? 'AUTO_CANARY+MANUAL' : 'AUTO_CANARY', cfg, now) ? 1 : 0;
-    }
-    for (const row of manual) {
-      const tokenRow = db.prepare(`SELECT symbol,first_seen_at,canary_at,last_seen_at,ath_price_usd,ath_price_at,current_price_usd,current_liquidity_usd,MAX(COALESCE(max_multiple_canary,0),COALESCE(max_multiple_discovery,0)) peak_multiple,COALESCE(monitor_stage,stage,'') source_stage FROM tokens WHERE token_address=?`).get(row.token_address) || {};
-      const op = db.prepare('SELECT risk_gate,risk_confidence,buy_blocked,hard_fail_count FROM opportunity_pool WHERE token_address=?').get(row.token_address) || {};
-      const merged = {
-        ...tokenRow,
-        ...row,
-        symbol: row.symbol || tokenRow.symbol || '',
-        ath_price_usd: row.ath_price_usd ?? tokenRow.ath_price_usd ?? null,
-        preferred_pair: row.preferred_pair || bestKnownPair(db, row.token_address),
-        risk_gate: op.risk_gate || row.risk_gate || 'CAUTION',
-        risk_confidence: op.risk_confidence ?? 0,
-        buy_blocked: op.buy_blocked ?? row.buy_blocked ?? 0,
-        hard_fail_count: op.hard_fail_count ?? 0,
-        manual_override: 1,
-      };
-      manualUpserts += upsertCandidate(db, merged, tokenRow.canary_at ? 'AUTO_CANARY+MANUAL' : 'MANUAL', cfg, now) ? 1 : 0;
-    }
-    return { autoUpserts, manualUpserts };
-  })();
-  return { ...result, ...getSecondLegCandidateHealth() };
+  })());
+
+  for (let offset = 0; offset < automatic.length; offset += WRITE_CHUNK_SIZE) {
+    const chunk = automatic.slice(offset, offset + WRITE_CHUNK_SIZE);
+    const changed = await withBusyRetry(() => db.transaction(() => {
+      let count = 0;
+      for (const row of chunk) {
+        const token = lower(row.token_address);
+        const existing = db.prepare('SELECT manual_override, enabled FROM second_leg_candidates WHERE token_address=?').get(token);
+        const manualStillPresent = manualSet.has(token);
+        count += upsertCandidate(db, { ...row, manual_override: manualStillPresent ? 1 : 0, enabled: existing?.enabled ?? 1 }, manualStillPresent ? 'AUTO_CANARY+MANUAL' : 'AUTO_CANARY', cfg, now) ? 1 : 0;
+      }
+      return count;
+    })());
+    autoUpserts += changed;
+    if (offset + WRITE_CHUNK_SIZE < automatic.length) await sleep(25);
+  }
+
+  if (manual.length) {
+    manualUpserts = await withBusyRetry(() => db.transaction(() => {
+      let count = 0;
+      for (const row of manual) {
+        const tokenRow = db.prepare(`SELECT symbol,first_seen_at,canary_at,last_seen_at,ath_price_usd,ath_price_at,current_price_usd,current_liquidity_usd,MAX(COALESCE(max_multiple_canary,0),COALESCE(max_multiple_discovery,0)) peak_multiple,COALESCE(monitor_stage,stage,'') source_stage FROM tokens WHERE token_address=?`).get(row.token_address) || {};
+        const op = db.prepare('SELECT risk_gate,risk_confidence,buy_blocked,hard_fail_count FROM opportunity_pool WHERE token_address=?').get(row.token_address) || {};
+        const merged = {
+          ...tokenRow,
+          ...row,
+          symbol: row.symbol || tokenRow.symbol || '',
+          ath_price_usd: row.ath_price_usd ?? tokenRow.ath_price_usd ?? null,
+          preferred_pair: row.preferred_pair || bestKnownPair(db, row.token_address),
+          risk_gate: op.risk_gate || row.risk_gate || 'CAUTION',
+          risk_confidence: op.risk_confidence ?? 0,
+          buy_blocked: op.buy_blocked ?? row.buy_blocked ?? 0,
+          hard_fail_count: op.hard_fail_count ?? 0,
+          manual_override: 1,
+        };
+        count += upsertCandidate(db, merged, tokenRow.canary_at ? 'AUTO_CANARY+MANUAL' : 'MANUAL', cfg, now) ? 1 : 0;
+      }
+      return count;
+    })());
+  }
+
+  return { autoUpserts, manualUpserts, writeChunkSize: WRITE_CHUNK_SIZE, ...getSecondLegCandidateHealth() };
 }
 
 export function getSecondLegCandidateWatchlist(limit = DEFAULTS.maxScanCandidates) {
