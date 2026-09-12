@@ -12,7 +12,7 @@ function ensureParentDir() {
 function configure(db) {
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
-  db.pragma('busy_timeout = 5000');
+  db.pragma('busy_timeout = 30000');
   db.pragma('foreign_keys = ON');
 }
 
@@ -156,7 +156,8 @@ function migrate(db) {
     CREATE INDEX IF NOT EXISTS idx_snapshots_token ON snapshots(token_address, snapshot_at);
     CREATE INDEX IF NOT EXISTS idx_snapshots_type ON snapshots(snapshot_type, snapshot_at);
   `);
-  db.pragma('user_version = 4');
+  const currentVersion = Number(db.pragma('user_version', { simple: true }) || 0);
+  if (currentVersion < 4) db.pragma('user_version = 4');
 }
 
 export function openDatabase() {
@@ -350,15 +351,23 @@ export function persistDiscoveryEvent(event = {}) {
   return tx();
 }
 
+let lastStaleRecoveryAt = 0;
+const STALE_RECOVERY_INTERVAL_MS = 60_000;
+
 export function claimDueJob() {
   const db = getDatabase();
-  const now = new Date().toISOString();
-  const stale = new Date(Date.now() - 10 * 60_000).toISOString();
-  return db.transaction(() => {
-    db.prepare(`
-      UPDATE jobs SET status='PENDING', started_at=NULL, updated_at=?
-      WHERE status='RUNNING' AND started_at IS NOT NULL AND started_at < ? AND retry_count < max_retries
-    `).run(now, stale);
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  const recoverStale = nowMs - lastStaleRecoveryAt >= STALE_RECOVERY_INTERVAL_MS;
+
+  const tx = db.transaction(() => {
+    if (recoverStale) {
+      const stale = new Date(nowMs - 10 * 60_000).toISOString();
+      db.prepare(`
+        UPDATE jobs SET status='PENDING', started_at=NULL, updated_at=?
+        WHERE status='RUNNING' AND started_at IS NOT NULL AND started_at < ? AND retry_count < max_retries
+      `).run(now, stale);
+    }
 
     const row = db.prepare(`
       SELECT * FROM jobs
@@ -376,7 +385,11 @@ export function claimDueJob() {
     `).run(now, now, row.job_id);
     if (!claimed.changes) return null;
     return { ...row, payload: parseJson(row.payload) };
-  })();
+  });
+
+  const result = tx();
+  if (recoverStale) lastStaleRecoveryAt = nowMs;
+  return result;
 }
 
 export function completeJob(jobId) {
