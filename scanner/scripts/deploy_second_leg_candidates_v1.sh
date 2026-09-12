@@ -84,7 +84,7 @@ python3 - "$GENERATED" <<'PY'
 import json,sqlite3,sys
 p=sys.argv[1]
 rows=json.load(open(p,encoding='utf-8'))
-con=sqlite3.connect('/data/rh_monitor.db',timeout=5)
+con=sqlite3.connect('/data/rh_monitor.db',timeout=30)
 con.row_factory=sqlite3.Row
 health=con.execute('''SELECT COUNT(*) total,
  SUM(CASE WHEN enabled=1 AND status='ACTIVE' THEN 1 ELSE 0 END) active,
@@ -110,19 +110,56 @@ if not rows:
     raise SystemExit(7)
 PY
 
-echo "Checking supervised second-leg worker consumes generated watchlist..."
-SECOND_LINE=""
-for _ in $(seq 1 18); do
-  SECOND_LINE="$(journalctl -u rh-chain-monitor.service --since "$DEPLOY_SINCE" --no-pager 2>/dev/null | grep -F '[second-leg cycle]' | tail -1 || true)"
-  if [[ -n "$SECOND_LINE" ]]; then break; fi
-  sleep 5
-done
-if [[ -z "$SECOND_LINE" ]]; then
-  echo "ERROR: no supervised second-leg cycle observed"
-  journalctl -u rh-chain-monitor.service --since "$DEPLOY_SINCE" --no-pager | tail -160 || true
+BOOT_LINE="$(journalctl -u rh-chain-monitor.service --since "$DEPLOY_SINCE" --no-pager 2>/dev/null | grep -F '[storage maintenance boot]' | tail -1 || true)"
+if [[ -z "$BOOT_LINE" ]]; then
+  echo "ERROR: supervised storage maintenance did not enter long-lived delayed mode"
   exit 8
 fi
+echo "$BOOT_LINE"
+
+# The first post-restart cycles can overlap schema/bootstrap work. Validate a fresh
+# steady-state candidate cycle and the following second-leg scan before declaring LIVE.
+VALIDATE_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
+echo "Waiting for one fresh steady-state candidate cycle..."
+NEXT_CYCLE=""
+for _ in $(seq 1 42); do
+  NEXT_CYCLE="$(journalctl -u rh-chain-monitor.service --since "$VALIDATE_SINCE" --no-pager 2>/dev/null | grep -F '[second-leg candidate cycle]' | tail -1 || true)"
+  if [[ -n "$NEXT_CYCLE" ]]; then break; fi
+  sleep 5
+done
+if [[ -z "$NEXT_CYCLE" ]]; then
+  echo "ERROR: no fresh candidate cycle observed during steady-state validation"
+  exit 9
+fi
+echo "$NEXT_CYCLE"
+
+echo "Checking supervised second-leg worker reaches an error-free cycle..."
+SECOND_LINE=""
+for _ in $(seq 1 42); do
+  SECOND_LINE="$(journalctl -u rh-chain-monitor.service --since "$VALIDATE_SINCE" --no-pager 2>/dev/null | grep -F '[second-leg cycle]' | tail -1 || true)"
+  if [[ "$SECOND_LINE" == *'"errors":0'* ]]; then break; fi
+  sleep 5
+done
+if [[ -z "$SECOND_LINE" || "$SECOND_LINE" != *'"errors":0'* ]]; then
+  echo "ERROR: second-leg worker did not reach an error-free cycle during validation"
+  journalctl -u rh-chain-monitor.service --since "$VALIDATE_SINCE" --no-pager | grep -E '\[second-leg item\]|\[second-leg cycle\]|database is locked' | tail -100 || true
+  exit 10
+fi
 echo "$SECOND_LINE"
+
+LOCK_LINES="$(journalctl -u rh-chain-monitor.service --since "$VALIDATE_SINCE" --no-pager 2>/dev/null | grep -E 'database is locked|database connection is not open' || true)"
+if [[ -n "$LOCK_LINES" ]]; then
+  echo "ERROR: SQLite lock errors observed during steady-state validation"
+  echo "$LOCK_LINES" | tail -80
+  exit 11
+fi
+
+STORAGE_EXIT="$(journalctl -u rh-chain-monitor.service --since "$VALIDATE_SINCE" --no-pager 2>/dev/null | grep -F '[shadow-supervisor storage-maintenance] exited' || true)"
+if [[ -n "$STORAGE_EXIT" ]]; then
+  echo "ERROR: storage maintenance exited during steady-state validation"
+  echo "$STORAGE_EXIT" | tail -20
+  exit 12
+fi
 
 restore_health
 HEALTH_WAS_ACTIVE=0
@@ -131,4 +168,4 @@ if systemctl list-unit-files --type=service | grep -q '^rh-chain-health.service'
   systemctl is-active --quiet rh-chain-health.service && echo "health monitor active" || true
 fi
 
-echo "DONE: Step 12 automatic second-leg candidate library V1 deployed"
+echo "DONE: Step 12 automatic second-leg candidate library V1 deployed and steady-state validated"
