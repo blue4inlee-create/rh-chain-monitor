@@ -34,23 +34,31 @@ systemctl restart rh-chain-monitor.service
 sleep 6
 systemctl is-active --quiet rh-chain-monitor.service
 
-echo "Waiting for supervised second-leg worker cycle (avoids a competing SQLite writer)..."
+echo "Waiting for supervised second-leg worker healthy cycle (avoids a competing SQLite writer)..."
 cycle_seen=0
+cycle_line=""
 for _ in $(seq 1 18); do
-  if journalctl -u rh-chain-monitor.service --since "$DEPLOY_STARTED" --no-pager \
-      | grep -q '\[second-leg cycle\]'; then
+  # Do not use `grep -q` under `set -o pipefail`: grep can exit early and make
+  # journalctl receive SIGPIPE, causing a false-negative pipeline status.
+  cycle_line="$(journalctl -u rh-chain-monitor.service --since "$DEPLOY_STARTED" --no-pager \
+    | grep -F '[second-leg cycle]' \
+    | tail -1 || true)"
+  if [[ -n "$cycle_line" && "$cycle_line" == *'"errors":0'* ]]; then
     cycle_seen=1
     break
   fi
   sleep 5
 done
 if [[ "$cycle_seen" -ne 1 ]]; then
-  echo "ERROR: no supervised second-leg cycle observed within 90 seconds"
+  echo "ERROR: no healthy supervised second-leg cycle (errors=0) observed within 90 seconds"
   journalctl -u rh-chain-monitor.service --since "$DEPLOY_STARTED" --no-pager \
     | grep -E '\[second-leg worker boot\]|\[second-leg cycle\]|\[second-leg worker\]|second-leg-alert-worker' \
     | tail -30 || true
   exit 4
 fi
+
+echo "Healthy second-leg cycle observed:"
+echo "$cycle_line"
 
 echo "Sending Bark + Telegram second-leg test..."
 node scanner/src/second_leg_alert_worker.mjs --test-notify
