@@ -57,18 +57,23 @@ async function main() {
     const started = Date.now();
     try { await runSecondLegCandidateCycle(); }
     catch (e) { console.error('[second-leg candidate worker]', e?.stack || e); }
-    await sleep(Math.max(1_000, CFG.pollMs - (Date.now() - started)));
+    if (!stopping) await sleep(Math.max(1_000, CFG.pollMs - (Date.now() - started)));
   }
 }
 
-function shutdown() {
+function requestShutdown() {
   stopping = true;
-  try { closeDatabase(); } catch {}
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+process.on('SIGTERM', requestShutdown);
+process.on('SIGINT', requestShutdown);
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  if (process.argv.includes('--once')) runSecondLegCandidateCycle().finally(shutdown);
-  else main().catch(e => { console.error('[second-leg candidate fatal]', e?.stack || e); process.exitCode = 1; });
+  if (process.argv.includes('--once')) {
+    runSecondLegCandidateCycle()
+      .finally(() => { try { closeDatabase(); } catch {} });
+  } else {
+    main()
+      .catch(e => { console.error('[second-leg candidate fatal]', e?.stack || e); process.exitCode = 1; })
+      .finally(() => { try { closeDatabase(); } catch {} });
+  }
 }
