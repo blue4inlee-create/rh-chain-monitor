@@ -5,6 +5,7 @@ let runner = null;
 let shadow = null;
 let opportunityWorker = null;
 let alertWorker = null;
+let secondLegCandidateWorker = null;
 let secondLegWorker = null;
 let shadowThresholdWorker = null;
 let historyWorker = null;
@@ -12,6 +13,7 @@ let historyExport = null;
 let storageMaintenance = null;
 let compareReport = null;
 let compareTimer = null;
+let secondLegStartTimer = null;
 
 function start(file, label, extraEnv = {}) {
   const child = spawn(process.execPath, [new URL(file, import.meta.url).pathname], {
@@ -37,7 +39,11 @@ function restartable(refSetter, file, label, extraEnv = {}) {
 function startShadow() { return restartable(x => { shadow = x; }, './fast_m30_shadow.mjs', 'fast-m30', { RH_HTTP_URL: process.env.FAST_M30_RPC_URL || process.env.RH_HTTP_URL }); }
 function startOpportunityWorker() { return restartable(x => { opportunityWorker = x; }, './opportunity_worker.mjs', 'opportunity-worker'); }
 function startAlertWorker() { return restartable(x => { alertWorker = x; }, './alert_worker.mjs', 'alert-worker'); }
-function startSecondLegWorker() { return restartable(x => { secondLegWorker = x; }, './second_leg_alert_worker.mjs', 'second-leg-alert-worker'); }
+function startSecondLegCandidateWorker() { return restartable(x => { secondLegCandidateWorker = x; }, './second_leg_candidate_worker.mjs', 'second-leg-candidate-worker'); }
+function startSecondLegWorker() {
+  const generated = process.env.SECOND_LEG_GENERATED_WATCHLIST || '/data/second_leg_watchlist.generated.json';
+  return restartable(x => { secondLegWorker = x; }, './second_leg_alert_worker.mjs', 'second-leg-alert-worker', { SECOND_LEG_WATCHLIST: generated });
+}
 function startShadowThresholdWorker() { return restartable(x => { shadowThresholdWorker = x; }, './shadow_threshold_worker.mjs', 'shadow-threshold-worker'); }
 function startHistoryWorker() { return restartable(x => { historyWorker = x; }, './history_worker.mjs', 'history-worker'); }
 function startHistoryExport() { return restartable(x => { historyExport = x; }, './history_export_server.mjs', 'history-export'); }
@@ -63,14 +69,17 @@ function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   if (compareTimer) clearInterval(compareTimer);
-  for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, alertWorker, opportunityWorker, shadow, runner]) kill(child, signal);
+  if (secondLegStartTimer) clearTimeout(secondLegStartTimer);
+  for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, secondLegCandidateWorker, alertWorker, opportunityWorker, shadow, runner]) kill(child, signal);
 }
 
 runner = start('./runner.mjs', 'runner');
 startShadow();
 startOpportunityWorker();
 startAlertWorker();
-startSecondLegWorker();
+startSecondLegCandidateWorker();
+secondLegStartTimer = setTimeout(startSecondLegWorker, 4000);
+secondLegStartTimer.unref();
 startShadowThresholdWorker();
 startHistoryWorker();
 startHistoryExport();
@@ -83,7 +92,8 @@ runner.on('exit', (code, signal) => {
   if (!stopping) {
     stopping = true;
     if (compareTimer) clearInterval(compareTimer);
-    for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, alertWorker, opportunityWorker, shadow]) kill(child, 'SIGTERM');
+    if (secondLegStartTimer) clearTimeout(secondLegStartTimer);
+    for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, secondLegCandidateWorker, alertWorker, opportunityWorker, shadow]) kill(child, 'SIGTERM');
   }
   console.error(`[shadow-supervisor runner] exited code=${code ?? ''} signal=${signal || ''}`);
   process.exitCode = Number.isInteger(code) ? code : 1;
