@@ -24,31 +24,47 @@ git pull --ff-only origin main
 npm --prefix scanner run check
 npm --prefix scanner run second-leg-check
 
-systemctl restart rh-chain-monitor.service
-sleep 6
-systemctl is-active --quiet rh-chain-monitor.service
-
 set -a
 # shellcheck disable=SC1090
 source "$ALERT_ENV"
 set +a
 
-echo "Running one live second-leg cycle..."
-node scanner/src/second_leg_alert_worker.mjs --once | tail -5 || true
+DEPLOY_STARTED="$(date --iso-8601=seconds)"
+systemctl restart rh-chain-monitor.service
+sleep 6
+systemctl is-active --quiet rh-chain-monitor.service
+
+echo "Waiting for supervised second-leg worker cycle (avoids a competing SQLite writer)..."
+cycle_seen=0
+for _ in $(seq 1 18); do
+  if journalctl -u rh-chain-monitor.service --since "$DEPLOY_STARTED" --no-pager \
+      | grep -q '\[second-leg cycle\]'; then
+    cycle_seen=1
+    break
+  fi
+  sleep 5
+done
+if [[ "$cycle_seen" -ne 1 ]]; then
+  echo "ERROR: no supervised second-leg cycle observed within 90 seconds"
+  journalctl -u rh-chain-monitor.service --since "$DEPLOY_STARTED" --no-pager \
+    | grep -E '\[second-leg worker boot\]|\[second-leg cycle\]|\[second-leg worker\]|second-leg-alert-worker' \
+    | tail -30 || true
+  exit 4
+fi
 
 echo "Sending Bark + Telegram second-leg test..."
 node scanner/src/second_leg_alert_worker.mjs --test-notify
 
-echo "Checking worker boot..."
-journalctl -u rh-chain-monitor.service -n 180 --no-pager \
+echo "Checking worker boot/cycle..."
+journalctl -u rh-chain-monitor.service --since "$DEPLOY_STARTED" --no-pager \
   | grep -E '\[second-leg worker boot\]|\[second-leg cycle\]|\[second-leg alert sent\]|second-leg-alert-worker' \
   | tail -20 || true
 
 if [[ -f /data/rh_monitor.db ]]; then
   python3 - <<'PY'
 import sqlite3
-p='/data/rh_monitor.db'
-c=sqlite3.connect(p)
+p='file:/data/rh_monitor.db?mode=ro'
+c=sqlite3.connect(p, uri=True, timeout=5)
 try:
   rows=c.execute("select symbol,stage,round(score,1),round(confidence,1),risk_gate,observed_at from second_leg_live order by symbol").fetchall()
   print('second_leg_live rows=',len(rows))
