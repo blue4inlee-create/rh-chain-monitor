@@ -39,6 +39,9 @@ jobs:
       - name: Shadow threshold pool synthetic check
         working-directory: scanner
         run: npm run shadow-check
+      - name: Health monitor hysteresis synthetic check
+        working-directory: scanner
+        run: npm run health-check
       - name: Check deployment scripts
         run: |
           bash -n scanner/scripts/configure_alert_channels.sh
@@ -47,6 +50,7 @@ jobs:
           bash -n scanner/scripts/deploy_shadow_threshold_pool_v1.sh
           bash -n scanner/scripts/deploy_health_monitor_v1.sh
           bash -n scanner/scripts/deploy_second_leg_alert_v1.sh
+          bash -n scanner/scripts/deploy_unified_home_v1.sh
       - name: Robinhood RPC smoke test
         working-directory: scanner
         run: npm run smoke
