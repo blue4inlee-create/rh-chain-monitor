@@ -10,7 +10,7 @@ const ONCE = /^(1|true|yes)$/i.test(String(process.env.STORAGE_MAINTENANCE_ONCE 
 
 function openDb() {
   const db = new Database(DB_PATH, { fileMustExist: true });
-  db.pragma('busy_timeout = 5000');
+  db.pragma('busy_timeout = 30000');
   return db;
 }
 
@@ -37,7 +37,7 @@ function hasColumn(db, table, column) {
 }
 
 function checkpoint(db) {
-  try { return db.pragma('wal_checkpoint(TRUNCATE)', { simple: false }); }
+  try { return db.pragma('wal_checkpoint(PASSIVE)', { simple: false }); }
   catch (err) { return { error: String(err?.message || err) }; }
 }
 
@@ -51,9 +51,7 @@ function deleteBatches(db, selectSql, params, limit = MAX_BATCHES) {
       const result = db.transaction(() => stmt.run(...params, BATCH_SIZE))();
       const changed = Number(result.changes || 0);
       deleted += changed;
-      if (!changed) break;
-      checkpoint(db);
-      if (changed < BATCH_SIZE) break;
+      if (!changed || changed < BATCH_SIZE) break;
     } catch (err) {
       error = String(err?.message || err);
       break;
@@ -159,20 +157,20 @@ export function maintainStorage() {
 }
 
 async function main() {
-  try {
-    maintainStorage();
-  } catch (err) {
-    console.error('[storage maintenance fatal]', err);
-    if (ONCE) process.exitCode = 1;
+  if (ONCE) {
+    try { maintainStorage(); }
+    catch (err) {
+      console.error('[storage maintenance fatal]', err);
+      process.exitCode = 1;
+    }
+    return;
   }
 
-  if (ONCE) return;
-  const timer = setInterval(() => {
+  console.log('[storage maintenance boot]', JSON.stringify({ intervalMs: INTERVAL_MS, firstRunDelayed: true, checkpointMode: 'PASSIVE' }));
+  setInterval(() => {
     try { maintainStorage(); }
     catch (err) { console.error('[storage maintenance]', err?.message || err); }
   }, INTERVAL_MS);
-  timer.unref();
-  await new Promise(() => {});
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) main();
