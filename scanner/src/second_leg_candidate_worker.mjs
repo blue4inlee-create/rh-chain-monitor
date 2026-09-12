@@ -1,19 +1,46 @@
+import { writeFile, rename } from 'node:fs/promises';
 import { initializeDatabase, closeDatabase } from './db.mjs';
-import { syncSecondLegCandidates, SECOND_LEG_CANDIDATE_DEFAULTS } from './second_leg_candidates.mjs';
+import {
+  syncSecondLegCandidates,
+  getSecondLegCandidateWatchlist,
+  SECOND_LEG_CANDIDATE_DEFAULTS,
+} from './second_leg_candidates.mjs';
 
 const CFG = {
   pollMs: Math.max(30_000, Number(process.env.SECOND_LEG_CANDIDATE_POLL_MS || 120_000)),
-  manualPath: String(process.env.SECOND_LEG_WATCHLIST || new URL('../config/second_leg_watchlist.json', import.meta.url).pathname),
+  manualPath: String(process.env.SECOND_LEG_MANUAL_WATCHLIST || new URL('../config/second_leg_watchlist.json', import.meta.url).pathname),
+  generatedPath: String(process.env.SECOND_LEG_GENERATED_WATCHLIST || '/data/second_leg_watchlist.generated.json'),
 };
 
 let stopping = false;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+async function writeGeneratedWatchlist(rows) {
+  const payload = rows.map(r => ({
+    symbol: r.symbol,
+    address: r.address,
+    preferredPair: r.preferredPair,
+    athPriceUsd: r.athPriceUsd,
+    fallbackRiskGate: r.fallbackRiskGate,
+    enabled: true,
+    candidateSource: r.candidateSource,
+    peakMultiple: r.peakMultiple,
+    manualOverride: r.manualOverride,
+  }));
+  const tmp = `${CFG.generatedPath}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  await rename(tmp, CFG.generatedPath);
+  return payload.length;
+}
+
 export async function runSecondLegCandidateCycle() {
   initializeDatabase();
   const r = await syncSecondLegCandidates({ manualPath: CFG.manualPath });
-  console.log('[second-leg candidate cycle]', JSON.stringify(r));
-  return r;
+  const watchlist = getSecondLegCandidateWatchlist(SECOND_LEG_CANDIDATE_DEFAULTS.maxScanCandidates);
+  const generated = await writeGeneratedWatchlist(watchlist);
+  const out = { ...r, generated, generatedPath: CFG.generatedPath };
+  console.log('[second-leg candidate cycle]', JSON.stringify(out));
+  return out;
 }
 
 async function main() {
@@ -24,6 +51,7 @@ async function main() {
     minPeakMultiple: SECOND_LEG_CANDIDATE_DEFAULTS.minPeakMultiple,
     minLiquidity: SECOND_LEG_CANDIDATE_DEFAULTS.minLiquidity,
     maxScanCandidates: SECOND_LEG_CANDIDATE_DEFAULTS.maxScanCandidates,
+    generatedPath: CFG.generatedPath,
   }));
   while (!stopping) {
     const started = Date.now();
