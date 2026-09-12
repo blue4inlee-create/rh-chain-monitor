@@ -13,7 +13,7 @@ let historyExport = null;
 let storageMaintenance = null;
 let compareReport = null;
 let compareTimer = null;
-let secondLegStartTimer = null;
+const startupTimers = [];
 
 function start(file, label, extraEnv = {}) {
   const child = spawn(process.execPath, [new URL(file, import.meta.url).pathname], {
@@ -34,6 +34,17 @@ function restartable(refSetter, file, label, extraEnv = {}) {
     setTimeout(() => restartable(refSetter, file, label, extraEnv), 5000).unref();
   });
   return child;
+}
+
+function schedule(fn, delayMs, label) {
+  const timer = setTimeout(() => {
+    if (stopping) return;
+    console.log(`[shadow-supervisor startup] ${label} after ${delayMs}ms`);
+    fn();
+  }, delayMs);
+  timer.unref();
+  startupTimers.push(timer);
+  return timer;
 }
 
 function startShadow() { return restartable(x => { shadow = x; }, './fast_m30_shadow.mjs', 'fast-m30', { RH_HTTP_URL: process.env.FAST_M30_RPC_URL || process.env.RH_HTTP_URL }); }
@@ -65,26 +76,29 @@ function startCompareReport() {
   });
 }
 function kill(child, signal) { if (child && !child.killed) child.kill(signal); }
+function clearStartupTimers() { for (const timer of startupTimers) clearTimeout(timer); }
 function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   if (compareTimer) clearInterval(compareTimer);
-  if (secondLegStartTimer) clearTimeout(secondLegStartTimer);
+  clearStartupTimers();
   for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, secondLegCandidateWorker, alertWorker, opportunityWorker, shadow, runner]) kill(child, signal);
 }
 
+// The runner owns the core scanner and performs the heaviest SQLite schema boot work.
+// Start it alone, then stagger auxiliary writers so they do not all execute SQLite
+// PRAGMA/schema initialization in the same millisecond after a systemd restart.
 runner = start('./runner.mjs', 'runner');
-startShadow();
-startOpportunityWorker();
-startAlertWorker();
-startSecondLegCandidateWorker();
-secondLegStartTimer = setTimeout(startSecondLegWorker, 4000);
-secondLegStartTimer.unref();
-startShadowThresholdWorker();
-startHistoryWorker();
-startHistoryExport();
-startStorageMaintenance();
-setTimeout(startCompareReport, 15000).unref();
+schedule(startShadow, 3000, 'fast-m30');
+schedule(startOpportunityWorker, 5000, 'opportunity-worker');
+schedule(startAlertWorker, 7000, 'alert-worker');
+schedule(startShadowThresholdWorker, 9000, 'shadow-threshold-worker');
+schedule(startHistoryWorker, 11000, 'history-worker');
+schedule(startHistoryExport, 13000, 'history-export');
+schedule(startStorageMaintenance, 15000, 'storage-maintenance');
+schedule(startSecondLegCandidateWorker, 17000, 'second-leg-candidate-worker');
+schedule(startSecondLegWorker, 21000, 'second-leg-alert-worker');
+schedule(startCompareReport, 25000, 'fast-compare');
 compareTimer = setInterval(startCompareReport, 300000);
 compareTimer.unref();
 
@@ -92,7 +106,7 @@ runner.on('exit', (code, signal) => {
   if (!stopping) {
     stopping = true;
     if (compareTimer) clearInterval(compareTimer);
-    if (secondLegStartTimer) clearTimeout(secondLegStartTimer);
+    clearStartupTimers();
     for (const child of [compareReport, storageMaintenance, historyExport, historyWorker, shadowThresholdWorker, secondLegWorker, secondLegCandidateWorker, alertWorker, opportunityWorker, shadow]) kill(child, 'SIGTERM');
   }
   console.error(`[shadow-supervisor runner] exited code=${code ?? ''} signal=${signal || ''}`);
