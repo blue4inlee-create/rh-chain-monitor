@@ -1,4 +1,4 @@
-import { advanceHttpsRouteState } from './production_health_monitor.mjs';
+import { advanceHttpsRouteState, isMarketTickStale } from './production_health_monitor.mjs';
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -37,3 +37,10 @@ assert(state.history.failures === 1, 'other route first failure should be record
 assert(state.history.incident === false, 'other route first failure must not alert');
 
 console.log('health monitor hysteresis check ok');
+
+const now = Date.parse('2026-09-12T15:00:00.000Z');
+assert(isMarketTickStale('2026-09-12T14:56:00.000Z', now, 300_000) === false, '4 minute old market tick should remain healthy');
+assert(isMarketTickStale('2026-09-12T14:54:59.000Z', now, 300_000) === true, 'market tick older than 5 minutes should be stale');
+assert(isMarketTickStale(null, now, 300_000) === true, 'missing market tick must be stale');
+
+console.log('health market-tick freshness check ok');

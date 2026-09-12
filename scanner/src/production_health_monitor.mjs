@@ -13,6 +13,7 @@ const CFG = {
   diskWarn: Number(process.env.HEALTH_DISK_WARN_PCT || 80),
   diskCritical: Number(process.env.HEALTH_DISK_CRITICAL_PCT || 92),
   opportunityStaleMs: Math.max(60_000, Number(process.env.HEALTH_OPPORTUNITY_STALE_MS || 180_000)),
+  marketTickStaleMs: Math.max(120_000, Number(process.env.HEALTH_MARKET_TICK_STALE_MS || 300_000)),
   httpTimeoutMs: Math.max(3_000, Number(process.env.HEALTH_HTTP_TIMEOUT_MS || 6_500)),
   opportunityHttpTimeoutMs: Math.max(6_000, Number(process.env.HEALTH_OPPORTUNITY_HTTP_TIMEOUT_MS || 12_000)),
   httpsFailConfirmations: Math.max(2, Number(process.env.HEALTH_HTTPS_FAIL_CONFIRMATIONS || 2)),
@@ -47,11 +48,22 @@ const PROCESSES = {
 };
 const bootMs = Date.now();
 let stopping = false;
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+let sleepWake = null;
+function sleep(ms) {
+  return new Promise(resolve => {
+    const wake = () => { clearTimeout(timer); if (sleepWake === wake) sleepWake = null; resolve(); };
+    const timer = setTimeout(() => { if (sleepWake === wake) sleepWake = null; resolve(); }, ms);
+    sleepWake = wake;
+  });
+}
 const text = v => v == null ? '' : String(v).trim();
 const nowIso = () => new Date().toISOString();
 const errText = e => text(e?.message || e).slice(0, 200);
 function ageMs(v) { const t = new Date(v || '').getTime(); return Number.isFinite(t) ? Math.max(0, Date.now() - t) : Infinity; }
+export function isMarketTickStale(latestAt, nowMs = Date.now(), thresholdMs = CFG.marketTickStaleMs) {
+  const t = new Date(latestAt || '').getTime();
+  return !Number.isFinite(t) || Math.max(0, nowMs - t) > thresholdMs;
+}
 
 async function loadState() {
   try { return JSON.parse(await readFile(CFG.statePath, 'utf8')); }
@@ -122,8 +134,18 @@ function databaseCheck() {
     const quick = text(db.pragma('quick_check', { simple: true })).toLowerCase();
     const table = n => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(n));
     const opportunityAt = table('opportunity_pool') ? db.prepare('SELECT MAX(updated_at) at FROM opportunity_pool').get()?.at || null : null;
+    const latestMarketTickAt = table('market_ticks') ? db.prepare('SELECT MAX(tick_at) at FROM market_ticks').get()?.at || null : null;
+    const marketTicksRecent15m = table('market_ticks') ? Number(db.prepare("SELECT COUNT(*) n FROM market_ticks WHERE julianday(tick_at)>=julianday('now','-15 minutes')").get()?.n || 0) : 0;
+    const marketTickAge = ageMs(latestMarketTickAt);
     const failedAlerts = table('alert_events') ? Number(db.prepare("SELECT COUNT(*) n FROM alert_events WHERE (bark_status='FAILED' OR telegram_status='FAILED')").get()?.n || 0) : 0;
-    return { ok: quick === 'ok', quick, opportunityAt, opportunityAgeSec: Number.isFinite(ageMs(opportunityAt)) ? Math.round(ageMs(opportunityAt)/1000) : null, failedAlerts };
+    return {
+      ok: quick === 'ok', quick, opportunityAt,
+      opportunityAgeSec: Number.isFinite(ageMs(opportunityAt)) ? Math.round(ageMs(opportunityAt)/1000) : null,
+      latestMarketTickAt,
+      marketTickAgeSec: Number.isFinite(marketTickAge) ? Math.round(marketTickAge/1000) : null,
+      marketTicksRecent15m,
+      failedAlerts,
+    };
   } catch (e) { return { ok: false, quick: 'error', opportunityAt: null, error: errText(e) }; }
   finally { try { db?.close(); } catch {} }
 }
@@ -197,6 +219,9 @@ function incidents(checks, httpsRoutes = {}) {
   for (const [k, v] of Object.entries(checks.processes)) if (!v.ok) add(k, 'CRITICAL', `${k} 进程缺失`, true);
   if (!checks.db.ok) add('sqlite', 'CRITICAL', `SQLite quick_check=${checks.db.quick}${checks.db.error ? ` ${checks.db.error}` : ''}`);
   if (checks.db.opportunityAt && ageMs(checks.db.opportunityAt) > CFG.opportunityStaleMs) add('opportunity-stale', 'CRITICAL', `Opportunity Pool 已 ${Math.round(ageMs(checks.db.opportunityAt)/1000)} 秒未刷新`, true);
+  if (isMarketTickStale(checks.db.latestMarketTickAt)) add('market-ticks-stale', 'CRITICAL', checks.db.latestMarketTickAt
+    ? `Market ticks 已 ${checks.db.marketTickAgeSec ?? '?'} 秒未刷新`
+    : 'Market ticks 尚无有效数据', true);
   if (!checks.caddy.ok) add('caddy', 'CRITICAL', `Caddy 异常：${checks.caddy.detail}`);
   const badRoutes = Object.entries(httpsRoutes).filter(([, v]) => v.incident).map(([k]) => k);
   if (badRoutes.length) add('https-exports', 'WARN', `HTTPS 出口连续异常：${badRoutes.join(', ')}`);
@@ -306,6 +331,7 @@ export async function runCycle({ forceNotify = false } = {}) {
       pollMs: CFG.pollMs,
       httpTimeoutMs: CFG.httpTimeoutMs,
       opportunityHttpTimeoutMs: CFG.opportunityHttpTimeoutMs,
+      marketTickStaleMs: CFG.marketTickStaleMs,
       httpsFailConfirmations: CFG.httpsFailConfirmations,
       httpsRecoveryConfirmations: CFG.httpsRecoveryConfirmations,
     },
@@ -322,6 +348,8 @@ export async function runCycle({ forceNotify = false } = {}) {
     restart: restart.attempted ? restart.ok : null,
     diskPct: checks.disk.usedPct,
     opportunityAgeSec: checks.db.opportunityAgeSec,
+    marketTickAgeSec: checks.db.marketTickAgeSec,
+    marketTicksRecent15m: checks.db.marketTicksRecent15m,
     pushAlerts: CFG.pushAlerts,
     httpsPending,
     poolAuditAnomalies: checks.poolAudit?.anomalyCount || 0,
@@ -353,6 +381,7 @@ async function main() {
     pushAlerts: CFG.pushAlerts,
     httpTimeoutMs: CFG.httpTimeoutMs,
     opportunityHttpTimeoutMs: CFG.opportunityHttpTimeoutMs,
+    marketTickStaleMs: CFG.marketTickStaleMs,
     httpsFailConfirmations: CFG.httpsFailConfirmations,
     httpsRecoveryConfirmations: CFG.httpsRecoveryConfirmations,
   }));
@@ -362,6 +391,7 @@ async function main() {
     await sleep(Math.max(1000, CFG.pollMs - (Date.now() - t)));
   }
 }
-process.on('SIGTERM', () => { stopping = true; });
-process.on('SIGINT', () => { stopping = true; });
+function requestStop() { stopping = true; if (sleepWake) sleepWake(); }
+process.on('SIGTERM', requestStop);
+process.on('SIGINT', requestStop);
 if (import.meta.url === `file://${process.argv[1]}`) main().catch(e => { console.error('[health monitor fatal]', e?.stack || e); process.exitCode = 1; });
