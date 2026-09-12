@@ -1,0 +1,242 @@
+import Database from 'better-sqlite3';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { readFile, writeFile, rename, statfs } from 'node:fs/promises';
+
+const execFileAsync = promisify(execFile);
+const CFG = {
+  pollMs: Math.max(15_000, Number(process.env.HEALTH_POLL_MS || 30_000)),
+  reminderMs: Math.max(300_000, Number(process.env.HEALTH_REMINDER_MS || 1_800_000)),
+  startupGraceMs: Math.max(15_000, Number(process.env.HEALTH_STARTUP_GRACE_MS || 90_000)),
+  restartAfter: Math.max(2, Number(process.env.HEALTH_RESTART_AFTER_FAILURES || 2)),
+  restartCooldownMs: Math.max(300_000, Number(process.env.HEALTH_RESTART_COOLDOWN_MS || 600_000)),
+  diskWarn: Number(process.env.HEALTH_DISK_WARN_PCT || 80),
+  diskCritical: Number(process.env.HEALTH_DISK_CRITICAL_PCT || 92),
+  opportunityStaleMs: Math.max(60_000, Number(process.env.HEALTH_OPPORTUNITY_STALE_MS || 180_000)),
+  dbPath: String(process.env.SQLITE_PATH || '/data/rh_monitor.db'),
+  statePath: String(process.env.HEALTH_STATE_PATH || '/data/rh_health_monitor_state.json'),
+  statusPath: String(process.env.HEALTH_STATUS_PATH || '/data/rh_health_status.json'),
+  rpcUrl: String(process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com'),
+  publicBase: String(process.env.HEALTH_PUBLIC_BASE || 'https://rh.192-236-234-216.sslip.io:8443').replace(/\/+$/, ''),
+  barkServer: String(process.env.BARK_SERVER || 'https://api.day.app').replace(/\/+$/, ''),
+  barkKey: String(process.env.BARK_DEVICE_KEY || '').trim(),
+  telegramToken: String(process.env.TELEGRAM_BOT_TOKEN || '').trim(),
+  telegramChatId: String(process.env.TELEGRAM_CHAT_ID || '').trim(),
+};
+const PUBLIC_ROUTES = {
+  opportunity: '/sheet-opportunity-71d9b4c2e8f6.csv',
+  history: '/sheet-history-4f0d7c91a2b8.csv',
+  calibration: '/sheet-calibration-8e3a1f6b7c2d.csv',
+  thresholds: '/sheet-thresholds-5a3d9c7e1b4f.csv',
+  shadow: '/sheet-shadow-2c7e9a4d1f6b.csv',
+};
+const PROCESSES = {
+  alertWorker: 'alert_worker.mjs',
+  historyWorker: 'history_worker.mjs',
+  opportunityWorker: 'opportunity_worker.mjs',
+  shadowWorker: 'shadow_threshold_worker.mjs',
+};
+const bootMs = Date.now();
+let stopping = false;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const text = v => v == null ? '' : String(v).trim();
+const nowIso = () => new Date().toISOString();
+const errText = e => text(e?.message || e).slice(0, 200);
+function ageMs(v) { const t = new Date(v || '').getTime(); return Number.isFinite(t) ? Math.max(0, Date.now() - t) : Infinity; }
+
+async function loadState() {
+  try { return JSON.parse(await readFile(CFG.statePath, 'utf8')); }
+  catch { return { active: [], failures: {}, lastNotifyAt: null, lastRestartAt: null }; }
+}
+async function writeJson(path, value) {
+  const tmp = `${path}.tmp`;
+  await writeFile(tmp, JSON.stringify(value, null, 2), 'utf8');
+  await rename(tmp, path);
+}
+async function cmd(command, args = []) {
+  try {
+    const { stdout = '' } = await execFileAsync(command, args, { timeout: 5000 });
+    return { ok: true, output: text(stdout) };
+  } catch (e) { return { ok: false, output: text(e?.stdout), error: errText(e) }; }
+}
+async function service(name) {
+  const r = await cmd('systemctl', ['is-active', name]);
+  return { ok: r.ok && r.output === 'active', detail: r.output || r.error || 'inactive' };
+}
+async function processCheck(pattern) {
+  const r = await cmd('pgrep', ['-af', pattern]);
+  return { ok: r.ok && Boolean(r.output), detail: r.ok ? 'running' : 'missing' };
+}
+async function httpCheck(url, json = false) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(6500), headers: { 'user-agent': 'rh-health-monitor/1.1' } });
+    let body = null;
+    if (json) { try { body = await r.json(); } catch {} }
+    else { try { await r.body?.cancel(); } catch {} }
+    return { ok: r.ok && (!json || body?.ok !== false), status: r.status, body };
+  } catch (e) { return { ok: false, status: 0, error: errText(e) }; }
+}
+async function diskCheck() {
+  try {
+    const s = await statfs('/data');
+    const total = Number(s.blocks) * Number(s.bsize);
+    const free = Number(s.bavail) * Number(s.bsize);
+    const pct = total ? (1 - free / total) * 100 : 0;
+    return { ok: pct < CFG.diskCritical, warn: pct >= CFG.diskWarn, usedPct: pct };
+  } catch (e) { return { ok: false, warn: true, usedPct: null, error: errText(e) }; }
+}
+function databaseCheck() {
+  let db;
+  try {
+    db = new Database(CFG.dbPath, { readonly: true, fileMustExist: true, timeout: 4000 });
+    const quick = text(db.pragma('quick_check', { simple: true })).toLowerCase();
+    const table = n => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(n));
+    const opportunityAt = table('opportunity_pool') ? db.prepare('SELECT MAX(updated_at) at FROM opportunity_pool').get()?.at || null : null;
+    const failedAlerts = table('alert_events') ? Number(db.prepare("SELECT COUNT(*) n FROM alert_events WHERE (bark_status='FAILED' OR telegram_status='FAILED')").get()?.n || 0) : 0;
+    return { ok: quick === 'ok', quick, opportunityAt, opportunityAgeSec: Number.isFinite(ageMs(opportunityAt)) ? Math.round(ageMs(opportunityAt)/1000) : null, failedAlerts };
+  } catch (e) { return { ok: false, quick: 'error', opportunityAt: null, error: errText(e) }; }
+  finally { try { db?.close(); } catch {} }
+}
+async function rpcCheck() {
+  try {
+    const r = await fetch(CFG.rpcUrl, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'user-agent': 'rh-health-monitor/1.1' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }), signal: AbortSignal.timeout(6500),
+    });
+    const raw = await r.text();
+    let j = null; try { j = JSON.parse(raw); } catch {}
+    return { ok: r.ok && Boolean(j?.result), status: r.status, rateLimited: r.status === 429, block: j?.result || null };
+  } catch (e) { return { ok: false, status: 0, rateLimited: false, error: errText(e) }; }
+}
+
+async function collect() {
+  const [main, caddy, scanner, history, disk, rpc] = await Promise.all([
+    service('rh-chain-monitor.service'), service('caddy.service'),
+    httpCheck('http://127.0.0.1:8080/health', true), httpCheck('http://127.0.0.1:3105/health', true),
+    diskCheck(), rpcCheck(),
+  ]);
+  const processes = {};
+  for (const [k, p] of Object.entries(PROCESSES)) processes[k] = await processCheck(p);
+  const publicRoutes = {};
+  for (const [k, p] of Object.entries(PUBLIC_ROUTES)) publicRoutes[k] = await httpCheck(`${CFG.publicBase}${p}`);
+  return {
+    checkedAt: nowIso(), main, caddy, scanner, history, disk, rpc,
+    db: databaseCheck(), processes, publicRoutes,
+    channels: { bark: Boolean(CFG.barkKey), telegram: Boolean(CFG.telegramToken && CFG.telegramChatId) },
+  };
+}
+function incidents(checks) {
+  const x = [];
+  const add = (key, severity, message, restartable = false) => x.push({ key, severity, message, restartable });
+  if (!checks.main.ok) add('main-service', 'CRITICAL', `主服务异常：${checks.main.detail}`, true);
+  if (!checks.scanner.ok) add('scanner-http', 'CRITICAL', `Scanner /health 异常 HTTP ${checks.scanner.status || 0}`, true);
+  if (!checks.history.ok) add('history-export', 'CRITICAL', `History Export 异常 HTTP ${checks.history.status || 0}`, true);
+  for (const [k, v] of Object.entries(checks.processes)) if (!v.ok) add(k, 'CRITICAL', `${k} 进程缺失`, true);
+  if (!checks.db.ok) add('sqlite', 'CRITICAL', `SQLite quick_check=${checks.db.quick}${checks.db.error ? ` ${checks.db.error}` : ''}`);
+  if (checks.db.opportunityAt && ageMs(checks.db.opportunityAt) > CFG.opportunityStaleMs) add('opportunity-stale', 'CRITICAL', `Opportunity Pool 已 ${Math.round(ageMs(checks.db.opportunityAt)/1000)} 秒未刷新`, true);
+  if (!checks.caddy.ok) add('caddy', 'CRITICAL', `Caddy 异常：${checks.caddy.detail}`);
+  const badRoutes = Object.entries(checks.publicRoutes).filter(([,v]) => !v.ok).map(([k]) => k);
+  if (badRoutes.length) add('https-exports', 'WARN', `HTTPS 出口异常：${badRoutes.join(', ')}`);
+  if (!checks.rpc.ok) add('rpc', 'WARN', checks.rpc.rateLimited ? 'Robinhood RPC 触发 429 限流' : `Robinhood RPC 异常 HTTP ${checks.rpc.status || 0}`);
+  if (checks.disk.usedPct != null && checks.disk.usedPct >= CFG.diskCritical) add('disk', 'CRITICAL', `磁盘使用率 ${checks.disk.usedPct.toFixed(1)}%`);
+  else if (checks.disk.warn) add('disk', 'WARN', `磁盘使用率 ${checks.disk.usedPct.toFixed(1)}%`);
+  if (!checks.channels.bark || !checks.channels.telegram) add('channels', 'CRITICAL', 'Bark / Telegram 至少一个未配置');
+  if ((checks.db.failedAlerts || 0) > 0) add('alert-failures', 'WARN', `提醒历史中存在 ${checks.db.failedAlerts} 条通道失败记录`);
+  return x;
+}
+
+async function sendBark(title, body) {
+  if (!CFG.barkKey) return { ok: false, skipped: true };
+  try {
+    const r = await fetch(`${CFG.barkServer}/${encodeURIComponent(CFG.barkKey)}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title, body, group: 'RH Chain System', level: 'timeSensitive' }), signal: AbortSignal.timeout(10000),
+    });
+    return { ok: r.ok, status: r.status };
+  } catch (e) { return { ok: false, error: errText(e) }; }
+}
+async function sendTelegram(title, body) {
+  if (!CFG.telegramToken || !CFG.telegramChatId) return { ok: false, skipped: true };
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${CFG.telegramToken}/sendMessage`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: CFG.telegramChatId, text: `${title}\n${body}`, disable_web_page_preview: true }), signal: AbortSignal.timeout(10000),
+    });
+    return { ok: r.ok, status: r.status };
+  } catch (e) { return { ok: false, error: errText(e) }; }
+}
+async function notify(title, body) {
+  const [bark, telegram] = await Promise.all([sendBark(title, body), sendTelegram(title, body)]);
+  console.log('[health notify]', JSON.stringify({ title, bark: bark.ok, telegram: telegram.ok, barkError: bark.error || '', telegramError: telegram.error || '' }));
+  return { bark, telegram };
+}
+function nextFailures(old, list) {
+  const active = new Set(list.map(i => i.key));
+  const out = { ...(old || {}) };
+  for (const key of new Set([...Object.keys(out), ...active])) out[key] = active.has(key) ? Number(out[key] || 0) + 1 : 0;
+  return out;
+}
+async function maybeRestart(state, list, failures) {
+  const reasons = list.filter(i => i.restartable && Number(failures[i.key] || 0) >= CFG.restartAfter).map(i => i.key);
+  if (!reasons.length) return { attempted: false };
+  const last = new Date(state.lastRestartAt || 0).getTime();
+  if (Number.isFinite(last) && Date.now() - last < CFG.restartCooldownMs) return { attempted: false, cooldown: true };
+  const r = await cmd('systemctl', ['restart', 'rh-chain-monitor.service']);
+  if (r.ok) await sleep(8000);
+  const result = { attempted: true, ok: r.ok, reasons, at: nowIso(), error: r.error || '' };
+  console.log('[health auto-restart]', JSON.stringify(result));
+  return result;
+}
+function bodyFor(list, restart) {
+  const lines = list.slice(0, 8).map(i => `${i.severity === 'CRITICAL' ? '🔴' : '🟡'} ${i.message}`);
+  if (restart.attempted) lines.push(restart.ok ? `♻️ 已自动重启主服务：${restart.reasons.join(', ')}` : `❌ 自动重启失败：${restart.error}`);
+  lines.push('系统告警与买币提醒相互独立。');
+  return lines.join('\n');
+}
+
+export async function runCycle({ forceNotify = false } = {}) {
+  const state = await loadState();
+  let checks = await collect();
+  let list = incidents(checks);
+  const failures = nextFailures(state.failures, list);
+  const restart = await maybeRestart(state, list, failures);
+  if (restart.attempted && restart.ok) { checks = await collect(); list = incidents(checks); }
+
+  const prev = new Set(state.active || []), cur = new Set(list.map(i => i.key));
+  const changed = prev.size !== cur.size || [...cur].some(k => !prev.has(k));
+  const resolved = [...prev].filter(k => !cur.has(k));
+  const lastNotify = new Date(state.lastNotifyAt || 0).getTime();
+  const reminder = list.length && (!Number.isFinite(lastNotify) || Date.now() - lastNotify >= CFG.reminderMs);
+  const grace = Date.now() - bootMs < CFG.startupGraceMs;
+  let notified = false;
+  if (!grace && list.length && (changed || reminder || forceNotify)) {
+    await notify(`${list.some(i => i.severity === 'CRITICAL') ? '⚠️' : '🟡'} RH Monitor 系统异常`, bodyFor(list, restart));
+    notified = true;
+  } else if (!grace && !list.length && resolved.length) {
+    await notify('✅ RH Monitor 已恢复', `已恢复：${resolved.join(', ')}\n扫描、评分、提醒、历史追踪与 Shadow 继续运行。`);
+    notified = true;
+  }
+  const next = { active: [...cur], failures, lastNotifyAt: notified ? nowIso() : state.lastNotifyAt || null, lastRestartAt: restart.attempted ? restart.at : state.lastRestartAt || null, updatedAt: nowIso() };
+  const status = { ok: list.length === 0, incidents: list, restart, checks, monitor: { grace, pollMs: CFG.pollMs }, updatedAt: nowIso() };
+  await writeJson(CFG.statePath, next); await writeJson(CFG.statusPath, status);
+  console.log('[health monitor]', JSON.stringify({ ok: status.ok, incidents: list.map(i => i.key), restart: restart.attempted ? restart.ok : null, diskPct: checks.disk.usedPct, opportunityAgeSec: checks.db.opportunityAgeSec }));
+  return status;
+}
+
+async function main() {
+  const args = new Set(process.argv.slice(2));
+  if (args.has('--test-notify')) {
+    console.log(JSON.stringify(await notify('✅ RH Monitor 健康监控已启用', '独立健康监控已上线。异常会通过 Bark + Telegram 推送；连续主服务故障会尝试自动重启。')));
+    return;
+  }
+  if (args.has('--once')) { const r = await runCycle({ forceNotify: args.has('--force-notify') }); console.log(JSON.stringify({ ok: r.ok, incidents: r.incidents }, null, 2)); return; }
+  console.log('[health monitor boot]', JSON.stringify({ pollMs: CFG.pollMs, restartAfter: CFG.restartAfter, diskWarn: CFG.diskWarn, diskCritical: CFG.diskCritical }));
+  while (!stopping) {
+    const t = Date.now();
+    try { await runCycle(); } catch (e) { console.error('[health monitor cycle]', e?.stack || e); }
+    await sleep(Math.max(1000, CFG.pollMs - (Date.now() - t)));
+  }
+}
+process.on('SIGTERM', () => { stopping = true; });
+process.on('SIGINT', () => { stopping = true; });
+if (import.meta.url === `file://${process.argv[1]}`) main().catch(e => { console.error('[health monitor fatal]', e?.stack || e); process.exitCode = 1; });
