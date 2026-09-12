@@ -5,6 +5,7 @@ APP_DIR="${APP_DIR:-/opt/rh-chain-monitor}"
 UNIT_FILE="/etc/systemd/system/rh-chain-health.service"
 ALERT_ENV="/etc/rh-chain-monitor-alert.env"
 NODE_BIN="$(command -v node)"
+MONITOR="$APP_DIR/scanner/src/production_health_monitor.mjs"
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "ERROR: run as root: sudo bash scanner/scripts/deploy_health_monitor_v1.sh"
@@ -17,7 +18,6 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   git status --short
   exit 2
 fi
-
 if [[ ! -f "$ALERT_ENV" ]]; then
   echo "ERROR: $ALERT_ENV missing; Bark/Telegram alert channels must be configured first"
   exit 3
@@ -43,8 +43,9 @@ Environment=HEALTH_RESTART_AFTER_FAILURES=2
 Environment=HEALTH_RESTART_COOLDOWN_MS=600000
 Environment=HEALTH_DISK_WARN_PCT=80
 Environment=HEALTH_DISK_CRITICAL_PCT=92
+Environment=HEALTH_OPPORTUNITY_STALE_MS=180000
 EnvironmentFile=$ALERT_ENV
-ExecStart=$NODE_BIN $APP_DIR/scanner/src/health_monitor.mjs
+ExecStart=$NODE_BIN $MONITOR
 Restart=always
 RestartSec=5
 TimeoutStopSec=15
@@ -68,7 +69,7 @@ set -a
 # shellcheck disable=SC1090
 source "$ALERT_ENV"
 set +a
-"$NODE_BIN" "$APP_DIR/scanner/src/health_monitor.mjs" --test-notify || true
+"$NODE_BIN" "$MONITOR" --test-notify || true
 
 if [[ -f /data/rh_health_status.json ]]; then
   python3 - <<'PY'
