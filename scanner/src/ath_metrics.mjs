@@ -1,6 +1,8 @@
 import { getDatabase } from './db.mjs';
 
 const MIN_BASELINE_MARKET_CAP_USD = Math.max(0, Number(process.env.BASELINE_MIN_MARKET_CAP_USD || 100));
+const MIN_QUALIFIED_DEX_LIQUIDITY_USD = Math.max(0, Number(process.env.QUALIFIED_DEX_MIN_LIQUIDITY_USD || 10_000));
+const MIN_QUALIFIED_PONS_RESERVE_USD = Math.max(0, Number(process.env.QUALIFIED_PONS_MIN_RESERVE_USD || 2_500));
 
 function hasColumn(db, table, column) {
   return db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column);
@@ -32,7 +34,17 @@ export function ensureAthSchema() {
     'max_multiple_discovery REAL',
     'canary_ath_price_usd REAL',
     'canary_ath_at TEXT',
-    'max_multiple_canary REAL'
+    'max_multiple_canary REAL',
+    'qualified_ath_price_usd REAL',
+    'qualified_ath_at TEXT',
+    'qualified_ath_market_cap REAL',
+    'qualified_ath_liquidity_usd REAL',
+    "qualified_ath_pool_key TEXT NOT NULL DEFAULT ''",
+    "qualified_ath_source TEXT NOT NULL DEFAULT ''",
+    'qualified_max_multiple_discovery REAL',
+    'qualified_canary_ath_price_usd REAL',
+    'qualified_canary_ath_at TEXT',
+    'qualified_max_multiple_canary REAL'
   ]) addColumn(db, 'tokens', definition);
 
   db.exec(`
@@ -63,6 +75,11 @@ export function ensureAthSchema() {
     db.pragma('user_version = 13');
   }
   backfillAthFromSnapshots(db);
+  const afterRaw = Number(db.pragma('user_version', { simple: true }) || 0);
+  if (afterRaw < 14) {
+    backfillQualifiedAth(db);
+    db.pragma('user_version = 14');
+  }
   return getAthHealth();
 }
 
@@ -220,6 +237,91 @@ function backfillAthFromSnapshots(db) {
   `);
 }
 
+function parsedRaw(value) {
+  if (value && typeof value === 'object') return value;
+  try { return JSON.parse(String(value || '{}')); }
+  catch { return {}; }
+}
+
+function ponsReserveUsd(value) {
+  return num(parsedRaw(value)?.reserveUsd);
+}
+
+function backfillQualifiedAth(db) {
+  const tokens = db.prepare(`
+    SELECT token_address,discovery_price_usd,discovery_market_cap,
+           canary_price_usd,canary_market_cap,canary_at
+    FROM tokens WHERE discovery_price_usd>0
+  `).all();
+  const ticks = db.prepare(`
+    SELECT token_address,tick_at,price_usd,market_cap,liquidity_usd,
+           source,pool_key,raw_data
+    FROM market_ticks
+    WHERE price_usd>0 AND market_cap>=${MIN_BASELINE_MARKET_CAP_USD}
+    ORDER BY token_address,tick_at ASC,id ASC
+  `).all();
+  const grouped = new Map();
+  const canonical = new Map();
+  for (const tick of ticks) {
+    if (!grouped.has(tick.token_address)) grouped.set(tick.token_address, []);
+    grouped.get(tick.token_address).push(tick);
+    if (text(tick.source).toLowerCase() === 'pons-curve') continue;
+    const pool = text(tick.pool_key).toLowerCase();
+    const liq = num(tick.liquidity_usd) || 0;
+    if (!pool) continue;
+    const key = `${tick.token_address}:${pool}`;
+    canonical.set(key, Math.max(canonical.get(key) || 0, liq));
+  }
+  const canonicalByToken = new Map();
+  for (const [key, liq] of canonical) {
+    const split = key.indexOf(':');
+    const token = key.slice(0, split), pool = key.slice(split + 1);
+    const prior = canonicalByToken.get(token);
+    if (!prior || liq > prior.liquidity) canonicalByToken.set(token, { pool, liquidity: liq });
+  }
+  const update = db.prepare(`
+    UPDATE tokens SET
+      qualified_ath_price_usd=?,qualified_ath_at=?,qualified_ath_market_cap=?,
+      qualified_ath_liquidity_usd=?,qualified_ath_pool_key=?,qualified_ath_source=?,
+      qualified_max_multiple_discovery=?,qualified_canary_ath_price_usd=?,
+      qualified_canary_ath_at=?,qualified_max_multiple_canary=?
+    WHERE token_address=?
+  `);
+  const tx = db.transaction(() => {
+    for (const token of tokens) {
+      const canonicalPool = canonicalByToken.get(token.token_address)?.pool || '';
+      let best = null, canaryBest = null;
+      for (const tick of grouped.get(token.token_address) || []) {
+        const source = text(tick.source).toLowerCase();
+        const pool = text(tick.pool_key).toLowerCase();
+        const liq = num(tick.liquidity_usd);
+        const reserve = ponsReserveUsd(tick.raw_data);
+        const qualified = source === 'pons-curve'
+          ? reserve != null && reserve >= MIN_QUALIFIED_PONS_RESERVE_USD
+          : pool === canonicalPool && liq != null && liq >= MIN_QUALIFIED_DEX_LIQUIDITY_USD;
+        if (!qualified) continue;
+        const price = num(tick.price_usd);
+        if (!(price > 0)) continue;
+        if (!best || price > best.price) best = { price, at: tick.tick_at, marketCap: num(tick.market_cap), liquidity: liq, pool, source: tick.source };
+        if (token.canary_at && tick.tick_at >= token.canary_at && (!canaryBest || price > canaryBest.price)) {
+          canaryBest = { price, at: tick.tick_at };
+        }
+      }
+      const discoveryMultiple = best && Number(token.discovery_price_usd) > 0 && Number(token.discovery_market_cap) >= MIN_BASELINE_MARKET_CAP_USD
+        ? best.price / Number(token.discovery_price_usd) : null;
+      const canaryMultiple = canaryBest && Number(token.canary_price_usd) > 0 && Number(token.canary_market_cap) >= MIN_BASELINE_MARKET_CAP_USD
+        ? canaryBest.price / Number(token.canary_price_usd) : null;
+      update.run(
+        best?.price ?? null, best?.at ?? null, best?.marketCap ?? null,
+        best?.liquidity ?? null, best?.pool ?? '', best?.source ?? '',
+        discoveryMultiple, canaryBest?.price ?? null, canaryBest?.at ?? null,
+        canaryMultiple, token.token_address,
+      );
+    }
+  });
+  tx();
+}
+
 export function recordMarketTick(data = {}) {
   const db = getDatabase();
   const token = text(data.tokenAddress).toLowerCase();
@@ -293,6 +395,20 @@ export function recordMarketTick(data = {}) {
       && Number(tokenRow.canary_price_usd) > 0
       && Number(tokenRow.canary_market_cap) >= MIN_BASELINE_MARKET_CAP_USD
       ? trustedValue / Number(tokenRow.canary_price_usd) : null;
+    const raw = parsedRaw(data.raw || {});
+    const source = text(row.source).toLowerCase();
+    const qualified = trustedPrice && (source === 'pons-curve'
+      ? (num(raw.reserveUsd) ?? 0) >= MIN_QUALIFIED_PONS_RESERVE_USD
+      : text(raw.pairSelection) === 'highest_liquidity'
+        && (num(row.liquidity_usd) ?? 0) >= MIN_QUALIFIED_DEX_LIQUIDITY_USD);
+    const qualifiedDiscoveryMultiple = qualified
+      && Number(tokenRow.discovery_price_usd) > 0
+      && Number(tokenRow.discovery_market_cap) >= MIN_BASELINE_MARKET_CAP_USD
+      ? price / Number(tokenRow.discovery_price_usd) : null;
+    const qualifiedCanaryMultiple = qualified && afterCanary
+      && Number(tokenRow.canary_price_usd) > 0
+      && Number(tokenRow.canary_market_cap) >= MIN_BASELINE_MARKET_CAP_USD
+      ? price / Number(tokenRow.canary_price_usd) : null;
 
     db.prepare(`
       UPDATE tokens SET
@@ -324,6 +440,28 @@ export function recordMarketTick(data = {}) {
       at, token,
     );
 
+    if (qualified) {
+      db.prepare(`
+        UPDATE tokens SET
+          qualified_ath_price_usd=CASE WHEN qualified_ath_price_usd IS NULL OR ? > qualified_ath_price_usd THEN ? ELSE qualified_ath_price_usd END,
+          qualified_ath_at=CASE WHEN qualified_ath_price_usd IS NULL OR ? > qualified_ath_price_usd THEN ? ELSE qualified_ath_at END,
+          qualified_ath_market_cap=CASE WHEN qualified_ath_price_usd IS NULL OR ? > qualified_ath_price_usd THEN ? ELSE qualified_ath_market_cap END,
+          qualified_ath_liquidity_usd=CASE WHEN qualified_ath_price_usd IS NULL OR ? > qualified_ath_price_usd THEN ? ELSE qualified_ath_liquidity_usd END,
+          qualified_ath_pool_key=CASE WHEN qualified_ath_price_usd IS NULL OR ? > qualified_ath_price_usd THEN ? ELSE qualified_ath_pool_key END,
+          qualified_ath_source=CASE WHEN qualified_ath_price_usd IS NULL OR ? > qualified_ath_price_usd THEN ? ELSE qualified_ath_source END,
+          qualified_max_multiple_discovery=CASE WHEN ? IS NOT NULL THEN MAX(COALESCE(qualified_max_multiple_discovery,0), ?) ELSE qualified_max_multiple_discovery END,
+          qualified_canary_ath_price_usd=CASE WHEN ? IS NOT NULL AND (qualified_canary_ath_price_usd IS NULL OR ? > qualified_canary_ath_price_usd) THEN ? ELSE qualified_canary_ath_price_usd END,
+          qualified_canary_ath_at=CASE WHEN ? IS NOT NULL AND (qualified_canary_ath_price_usd IS NULL OR ? > qualified_canary_ath_price_usd) THEN ? ELSE qualified_canary_ath_at END,
+          qualified_max_multiple_canary=CASE WHEN ? IS NOT NULL THEN MAX(COALESCE(qualified_max_multiple_canary,0), ?) ELSE qualified_max_multiple_canary END
+        WHERE token_address=?
+      `).run(
+        price,price,price,at,price,mc,price,row.liquidity_usd,price,row.pool_key,price,row.source,
+        qualifiedDiscoveryMultiple,qualifiedDiscoveryMultiple,
+        qualifiedCanaryMultiple,price,price,qualifiedCanaryMultiple,price,at,
+        qualifiedCanaryMultiple,qualifiedCanaryMultiple,token,
+      );
+    }
+
     return {
       ok: true,
       token,
@@ -334,6 +472,9 @@ export function recordMarketTick(data = {}) {
       newCanaryAth,
       discoveryMultiple,
       canaryMultiple,
+      qualified,
+      qualifiedDiscoveryMultiple,
+      qualifiedCanaryMultiple,
     };
   })();
 }
@@ -348,6 +489,8 @@ export function getAthHealth() {
       SUM(CASE WHEN canary_ath_price_usd IS NOT NULL THEN 1 ELSE 0 END) AS canary_ath_priced,
       SUM(CASE WHEN max_multiple_canary IS NOT NULL THEN 1 ELSE 0 END) AS canary_multiples,
       MAX(max_multiple_canary) AS best_canary_multiple,
+      MAX(qualified_max_multiple_canary) AS best_qualified_canary_multiple,
+      SUM(CASE WHEN qualified_ath_price_usd IS NOT NULL THEN 1 ELSE 0 END) AS qualified_ath_priced,
       MAX(current_price_at) AS latest_tick_at
     FROM tokens
   `).get() || {};
@@ -359,6 +502,10 @@ export function getAthHealth() {
     canaryAthPriced: Number(row.canary_ath_priced || 0),
     canaryMultiples: Number(row.canary_multiples || 0),
     bestCanaryMultiple: num(row.best_canary_multiple),
+    bestQualifiedCanaryMultiple: num(row.best_qualified_canary_multiple),
+    qualifiedAthPriced: Number(row.qualified_ath_priced || 0),
+    qualifiedDexMinLiquidityUsd: MIN_QUALIFIED_DEX_LIQUIDITY_USD,
+    qualifiedPonsMinReserveUsd: MIN_QUALIFIED_PONS_RESERVE_USD,
     marketTicks: ticks,
     latestTickAt: row.latest_tick_at || null,
   };

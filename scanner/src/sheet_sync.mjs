@@ -148,11 +148,11 @@ function canaryRows(db, lookup) {
       safe(t.canary_at), safe(t.symbol), t.token_address, safe(t.first_source), safe(t.canary_price_usd),
       safe(t.canary_market_cap), safe(entrySnap.liquidity_usd), safe(t.current_price_usd),
       safe(t.current_market_cap), safe(t.current_liquidity_usd), currentMultiple,
-      safe(t.max_multiple_canary), '', safe(tick.volume_5m), safe(tick.buy_count_5m), safe(tick.sell_count_5m),
+      safe(t.qualified_max_multiple_canary), '', safe(tick.volume_5m), safe(tick.buy_count_5m), safe(tick.sell_count_5m),
       '', '', mechanism, '', safe(score.final_score), safe(entry.score_at_change),
       safe(t.monitor_stage || 'CANARY'), '', risks.detail, safe(t.current_price_at || t.updated_at),
       safe(t.discovery_price_usd), safe(t.discovery_market_cap), safe(initial.liquidity_usd),
-      shortJson(`ATH=${safe(t.canary_ath_price_usd)} | Risk=${risks.safety}`, 500),
+      shortJson(`QualifiedATH=${safe(t.qualified_canary_ath_price_usd)} | RawATH=${safe(t.canary_ath_price_usd)} | Risk=${risks.safety}`, 500),
       safe(pool.pool_key || t.first_pool_key), '', mechanism
     ];
   });

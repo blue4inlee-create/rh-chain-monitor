@@ -104,8 +104,9 @@ async function ponsMetrics(row) {
   if (!validAddress(row.token_address)) return null;
   const launch = await readContract(CFG.ponsFactory, factoryAbi, 'getLaunchedToken', [getAddress(row.token_address)]);
   if (!launch?.exists || Number(launch.phase ?? 0) !== 0 || !validAddress(launch.curve)) return null;
-  const [reserves, qDecimals, qUsd] = await Promise.all([
+  const [reserves, realQuote, qDecimals, qUsd] = await Promise.all([
     readContract(launch.curve, curveAbi, 'getReserves'),
+    readContract(launch.curve, curveAbi, 'realQuoteReserve'),
     quoteDecimals(launch.pairToken),
     quoteUsd(launch.pairToken),
   ]);
@@ -116,6 +117,11 @@ async function ponsMetrics(row) {
   if (!(quoteReserve >= 0) || !(tokenReserve > 0)) return null;
   const priceUsd = (quoteReserve / tokenReserve) * qUsd;
   let marketCap = null;
+  let reserveUsd = null;
+  if (realQuote != null) {
+    const realQuoteValue = Number(formatUnits(BigInt(realQuote), qDecimals));
+    if (Number.isFinite(realQuoteValue)) reserveUsd = realQuoteValue * qUsd;
+  }
   if (row.total_supply) {
     try {
       const supply = Number(formatUnits(BigInt(row.total_supply), tokenDecimals));
@@ -126,23 +132,27 @@ async function ponsMetrics(row) {
     priceUsd,
     marketCap,
     liquidityUsd: null,
+    reserveUsd,
     source: 'pons-curve',
     poolKey: text(launch.curve).toLowerCase(),
+    pairSelection: 'pons-curve',
   };
 }
 
 export async function probeTokenMarket(row = {}) {
   const token = text(row.token_address).toLowerCase();
   if (!validAddress(token)) return null;
-  const pair = bestPair(await dexPairs(token), row.first_pool_key);
+  const pair = bestPair(await dexPairs(token));
   const price = num(pair?.priceUsd);
   if (price != null && price > 0) {
     return {
       priceUsd: price,
       marketCap: num(pair?.marketCap) ?? num(pair?.fdv),
       liquidityUsd: num(pair?.liquidity?.usd),
+      reserveUsd: null,
       source: text(pair?.dexId) || 'dexscreener',
       poolKey: text(pair?.pairAddress).toLowerCase() || text(row.first_pool_key).toLowerCase(),
+      pairSelection: 'highest_liquidity',
     };
   }
   return ponsMetrics({ ...row, token_address: token });

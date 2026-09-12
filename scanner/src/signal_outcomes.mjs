@@ -1,5 +1,8 @@
 import { getDatabase } from './db.mjs';
 
+const QUALIFIED_DEX_MIN_LIQUIDITY_USD = Math.max(0, Number(process.env.QUALIFIED_DEX_MIN_LIQUIDITY_USD || 10_000));
+const QUALIFIED_PONS_MIN_RESERVE_USD = Math.max(0, Number(process.env.QUALIFIED_PONS_MIN_RESERVE_USD || 2_500));
+
 export const MILESTONES = [
   { key: 'm15', ms: 15 * 60_000, toleranceMs: 4 * 60_000 },
   { key: 'h1', ms: 60 * 60_000, toleranceMs: 8 * 60_000 },
@@ -18,6 +21,9 @@ function pct(price, entry) {
   if (p == null || e == null || e <= 0) return null;
   return ((p / e) - 1) * 100;
 }
+function parsedRaw(v) { try { return JSON.parse(String(v || '{}')); } catch { return {}; } }
+function hasColumn(db, table, column) { return db.prepare(`PRAGMA table_info(${table})`).all().some(r => r.name === column); }
+function addColumn(db, table, definition) { const column = definition.trim().split(/\s+/)[0]; if (!hasColumn(db, table, column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`); }
 function median(values) {
   const xs = values.map(num).filter(v => v != null).sort((a, b) => a - b);
   if (!xs.length) return null;
@@ -58,6 +64,8 @@ export function ensureSignalOutcomeSchema() {
       max_adverse_pct REAL,
       max_drawdown_pct REAL,
       max_multiple REAL,
+      raw_max_price_usd REAL,
+      raw_max_multiple REAL,
       first_30_at TEXT,
       first_50_at TEXT,
       first_100_at TEXT,
@@ -82,6 +90,9 @@ export function ensureSignalOutcomeSchema() {
       price_usd REAL,
       market_cap REAL,
       liquidity_usd REAL,
+      reserve_usd REAL,
+      pool_key TEXT NOT NULL DEFAULT '',
+      qualified INTEGER NOT NULL DEFAULT 0,
       source TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL,
       UNIQUE(event_key, sample_at),
@@ -92,32 +103,37 @@ export function ensureSignalOutcomeSchema() {
     CREATE INDEX IF NOT EXISTS idx_signal_outcomes_token ON signal_outcomes(token_address, triggered_at DESC);
     CREATE INDEX IF NOT EXISTS idx_signal_outcome_ticks_event ON signal_outcome_ticks(event_key, sample_at);
   `);
+  addColumn(db, 'signal_outcomes', 'raw_max_price_usd REAL');
+  addColumn(db, 'signal_outcomes', 'raw_max_multiple REAL');
+  addColumn(db, 'signal_outcome_ticks', 'reserve_usd REAL');
+  addColumn(db, 'signal_outcome_ticks', "pool_key TEXT NOT NULL DEFAULT ''");
+  addColumn(db, 'signal_outcome_ticks', 'qualified INTEGER NOT NULL DEFAULT 0');
   return db;
 }
 
 function seedObservation(db, token, triggeredAt) {
   const prior = db.prepare(`
-    SELECT tick_at AS at, price_usd, market_cap, liquidity_usd, source
+    SELECT tick_at AS at, price_usd, market_cap, liquidity_usd, source,pool_key,raw_data
     FROM market_ticks
     WHERE token_address=? AND price_usd>0 AND tick_at<=?
     ORDER BY tick_at DESC LIMIT 1
   `).get(token, triggeredAt);
-  if (prior) return prior;
+  if (prior) return { ...prior, reserve_usd: num(parsedRaw(prior.raw_data)?.reserveUsd) };
   const after = db.prepare(`
-    SELECT tick_at AS at, price_usd, market_cap, liquidity_usd, source
+    SELECT tick_at AS at, price_usd, market_cap, liquidity_usd, source,pool_key,raw_data
     FROM market_ticks
     WHERE token_address=? AND price_usd>0 AND tick_at>?
     ORDER BY tick_at ASC LIMIT 1
   `).get(token, triggeredAt);
-  if (after && new Date(after.at).getTime() - new Date(triggeredAt).getTime() <= 10 * 60_000) return after;
+  if (after && new Date(after.at).getTime() - new Date(triggeredAt).getTime() <= 10 * 60_000) return { ...after, reserve_usd: num(parsedRaw(after.raw_data)?.reserveUsd) };
   const snap = db.prepare(`
-    SELECT snapshot_at AS at, price_usd, market_cap, liquidity_usd, dex AS source
+    SELECT snapshot_at AS at, price_usd, market_cap, liquidity_usd, dex AS source,pair_address AS pool_key,raw_data
     FROM snapshots
     WHERE token_address=? AND price_usd>0
     ORDER BY ABS(strftime('%s', snapshot_at)-strftime('%s', ?)) ASC
     LIMIT 1
   `).get(token, triggeredAt);
-  if (snap && Math.abs(new Date(snap.at).getTime() - new Date(triggeredAt).getTime()) <= 10 * 60_000) return snap;
+  if (snap && Math.abs(new Date(snap.at).getTime() - new Date(triggeredAt).getTime()) <= 10 * 60_000) return { ...snap, reserve_usd: num(parsedRaw(snap.raw_data)?.pons?.reserveUsd) };
   const current = db.prepare(`
     SELECT current_price_at AS at, current_price_usd AS price_usd,
            current_market_cap AS market_cap, current_liquidity_usd AS liquidity_usd,
@@ -166,6 +182,8 @@ export function syncOutcomesFromAlerts() {
         priceUsd: seed.price_usd,
         marketCap: seed.market_cap,
         liquidityUsd: seed.liquidity_usd,
+        reserveUsd: seed.reserve_usd,
+        poolKey: seed.pool_key,
         source: seed.source || 'seed',
       });
     }
@@ -173,21 +191,30 @@ export function syncOutcomesFromAlerts() {
   return added;
 }
 
-export function recordOutcomeSample({ eventKey, tokenAddress, sampleAt, priceUsd, marketCap, liquidityUsd, source = '' } = {}) {
+export function recordOutcomeSample({ eventKey, tokenAddress, sampleAt, priceUsd, marketCap, liquidityUsd, reserveUsd, poolKey = '', source = '' } = {}) {
   const db = ensureSignalOutcomeSchema();
   const price = num(priceUsd);
   if (!eventKey || !tokenAddress || price == null || price <= 0) return { ok: false, reason: 'invalid_sample' };
   const at = text(sampleAt) || new Date().toISOString();
+  const src = text(source).toLowerCase();
+  const liq = num(liquidityUsd);
+  const reserve = num(reserveUsd);
+  const qualified = src.includes('pons')
+    ? reserve != null && reserve >= QUALIFIED_PONS_MIN_RESERVE_USD
+    : liq != null && liq >= QUALIFIED_DEX_MIN_LIQUIDITY_USD;
   db.prepare(`
     INSERT INTO signal_outcome_ticks
-      (event_key,token_address,sample_at,price_usd,market_cap,liquidity_usd,source,created_at)
-    VALUES (?,?,?,?,?,?,?,?)
+      (event_key,token_address,sample_at,price_usd,market_cap,liquidity_usd,reserve_usd,pool_key,qualified,source,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(event_key,sample_at) DO UPDATE SET
       price_usd=excluded.price_usd,
       market_cap=COALESCE(excluded.market_cap, signal_outcome_ticks.market_cap),
       liquidity_usd=COALESCE(excluded.liquidity_usd, signal_outcome_ticks.liquidity_usd),
+      reserve_usd=COALESCE(excluded.reserve_usd, signal_outcome_ticks.reserve_usd),
+      pool_key=CASE WHEN excluded.pool_key<>'' THEN excluded.pool_key ELSE signal_outcome_ticks.pool_key END,
+      qualified=excluded.qualified,
       source=CASE WHEN excluded.source<>'' THEN excluded.source ELSE signal_outcome_ticks.source END
-  `).run(eventKey, tokenAddress.toLowerCase(), at, price, num(marketCap), num(liquidityUsd), text(source), at);
+  `).run(eventKey, tokenAddress.toLowerCase(), at, price, num(marketCap), liq, reserve, text(poolKey).toLowerCase(), qualified ? 1 : 0, text(source), at);
   db.prepare(`
     UPDATE signal_outcomes
     SET entry_price_usd=COALESCE(entry_price_usd,?),
@@ -237,13 +264,15 @@ export function recomputeOutcome(eventKey, now = new Date()) {
   const entry = num(row.entry_price_usd);
   if (entry == null || entry <= 0) return row;
   const samples = db.prepare(`
-    SELECT sample_at,price_usd,market_cap,liquidity_usd
+    SELECT sample_at,price_usd,market_cap,liquidity_usd,reserve_usd,pool_key,qualified
     FROM signal_outcome_ticks
     WHERE event_key=? AND price_usd>0
     ORDER BY sample_at ASC
   `).all(eventKey);
   if (!samples.length) return row;
 
+  const qualifiedSamples = samples.filter(s => Number(s.qualified || 0) === 1);
+  let rawMaxPrice = entry;
   let maxPrice = entry;
   let minPrice = entry;
   let peak = entry;
@@ -251,11 +280,12 @@ export function recomputeOutcome(eventKey, now = new Date()) {
   for (const s of samples) {
     const p = num(s.price_usd);
     if (p == null) continue;
-    maxPrice = Math.max(maxPrice, p);
+    rawMaxPrice = Math.max(rawMaxPrice, p);
     minPrice = Math.min(minPrice, p);
     peak = Math.max(peak, p);
     if (peak > 0) maxDrawdown = Math.min(maxDrawdown, ((p / peak) - 1) * 100);
   }
+  for (const s of qualifiedSamples) { const p = num(s.price_usd); if (p != null) maxPrice = Math.max(maxPrice, p); }
   const maxRunup = pct(maxPrice, entry);
   const maxAdverse = pct(minPrice, entry);
   const triggeredMs = new Date(row.triggered_at).getTime();
@@ -268,9 +298,9 @@ export function recomputeOutcome(eventKey, now = new Date()) {
     values[`${m.key}_return_pct`] = sample ? pct(sample.price_usd, entry) : row[`${m.key}_return_pct`];
     values[`${m.key}_at`] = sample ? sample.sample_at : row[`${m.key}_at`];
   }
-  const first30 = row.first_30_at || firstThreshold(samples, entry, 30, 'up');
-  const first50 = row.first_50_at || firstThreshold(samples, entry, 50, 'up');
-  const first100 = row.first_100_at || firstThreshold(samples, entry, 100, 'up');
+  const first30 = row.first_30_at || firstThreshold(qualifiedSamples, entry, 30, 'up');
+  const first50 = row.first_50_at || firstThreshold(qualifiedSamples, entry, 50, 'up');
+  const first100 = row.first_100_at || firstThreshold(qualifiedSamples, entry, 100, 'up');
   const firstMinus30 = row.first_minus30_at || firstThreshold(samples, entry, -30, 'down');
   const cleanWin30 = Boolean(first30 && (!firstMinus30 || first30 < firstMinus30));
   const complete = elapsed >= 24 * 60 * 60_000 && Boolean(values.h24_at);
@@ -286,6 +316,7 @@ export function recomputeOutcome(eventKey, now = new Date()) {
       h6_price=@h6_price,h6_return_pct=@h6_return_pct,h6_at=@h6_at,
       h24_price=@h24_price,h24_return_pct=@h24_return_pct,h24_at=@h24_at,
       max_price_usd=@max_price_usd,min_price_usd=@min_price_usd,
+      raw_max_price_usd=@raw_max_price_usd,raw_max_multiple=@raw_max_multiple,
       max_runup_pct=@max_runup_pct,max_adverse_pct=@max_adverse_pct,
       max_drawdown_pct=@max_drawdown_pct,max_multiple=@max_multiple,
       first_30_at=@first_30_at,first_50_at=@first_50_at,first_100_at=@first_100_at,first_minus30_at=@first_minus30_at,
@@ -297,6 +328,8 @@ export function recomputeOutcome(eventKey, now = new Date()) {
     event_key: eventKey,
     ...values,
     max_price_usd: maxPrice,
+    raw_max_price_usd: rawMaxPrice,
+    raw_max_multiple: rawMaxPrice / entry,
     min_price_usd: minPrice,
     max_runup_pct: maxRunup,
     max_adverse_pct: maxAdverse,

@@ -21,6 +21,8 @@ let lastSummaryAt = 0;
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function text(v) { return v == null ? '' : String(v).trim(); }
+function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+function parsedRaw(v) { try { return JSON.parse(String(v || '{}')); } catch { return {}; } }
 function isShadow(row) { return text(row.event_type).startsWith('SHADOW_'); }
 
 function ageMs(row, now = Date.now()) {
@@ -53,12 +55,14 @@ function latestFreshTick(token, shadow, now = Date.now()) {
   const cutoff = new Date(now - maxAge).toISOString();
   const tick = db.prepare(`
     SELECT tick_at AS sampleAt,price_usd AS priceUsd,market_cap AS marketCap,
-           liquidity_usd AS liquidityUsd,source
+           liquidity_usd AS liquidityUsd,source,pool_key AS poolKey,raw_data
     FROM market_ticks
     WHERE token_address=? AND price_usd>0 AND tick_at>=?
     ORDER BY tick_at DESC LIMIT 1
   `).get(token, cutoff);
-  return tick || null;
+  if (!tick) return null;
+  const raw = parsedRaw(tick.raw_data);
+  return { ...tick, reserveUsd: num(raw?.reserveUsd), raw_data: undefined };
 }
 
 async function getMarketForGroup(rows) {
@@ -113,6 +117,8 @@ async function cycle() {
             priceUsd: market.priceUsd,
             marketCap: market.marketCap,
             liquidityUsd: market.liquidityUsd,
+            reserveUsd: market.reserveUsd,
+            poolKey: market.poolKey,
             source: market.source || (market.cached ? 'market-ticks-cache' : 'history-probe'),
           });
           recomputeOutcome(row.event_key, new Date());

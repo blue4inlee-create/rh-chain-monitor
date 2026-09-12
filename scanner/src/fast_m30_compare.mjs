@@ -18,6 +18,34 @@ function yn(v) { return v ? 'Y' : 'N'; }
 export function buildFastM30CompareRows() {
   const db = getDatabase();
   const rows = db.prepare(`
+    WITH canonical_pool AS (
+      SELECT token_address,pool_key FROM (
+        SELECT token_address,pool_key,MAX(liquidity_usd) AS max_liq,
+               ROW_NUMBER() OVER (PARTITION BY token_address ORDER BY MAX(liquidity_usd) DESC) AS rn
+        FROM market_ticks
+        WHERE source<>'pons-curve' AND pool_key<>'' AND liquidity_usd IS NOT NULL
+        GROUP BY token_address,pool_key
+      ) WHERE rn=1
+    ),
+    qualified_obs AS (
+      SELECT mt.token_address,mt.tick_at AS at,mt.market_cap AS mc
+      FROM market_ticks mt
+      LEFT JOIN canonical_pool cp ON cp.token_address=mt.token_address
+      WHERE mt.market_cap IS NOT NULL AND mt.market_cap>0 AND (
+        (mt.source='pons-curve' AND COALESCE(CAST(json_extract(mt.raw_data,'$.reserveUsd') AS REAL),0)>=2500)
+        OR
+        (mt.source<>'pons-curve' AND mt.liquidity_usd>=10000 AND lower(mt.pool_key)=lower(cp.pool_key))
+      )
+      UNION ALL
+      SELECT s.token_address,s.snapshot_at AS at,s.market_cap AS mc
+      FROM snapshots s
+      LEFT JOIN canonical_pool cp ON cp.token_address=s.token_address
+      WHERE s.market_cap IS NOT NULL AND s.market_cap>0 AND (
+        (s.source_status LIKE '%PONS_CURVE_OK%' AND COALESCE(CAST(json_extract(s.raw_data,'$.pons.reserveUsd') AS REAL),0)>=2500)
+        OR
+        (s.liquidity_usd>=10000 AND lower(s.pair_address)=lower(cp.pool_key))
+      )
+    )
     SELECT
       f.token_address,
       COALESCE(t.symbol, '') AS symbol,
@@ -30,59 +58,33 @@ export function buildFastM30CompareRows() {
       t.canary_market_cap AS canary_entry_mc,
       t.first_source,
       (
-        SELECT x.at FROM (
-          SELECT mt.tick_at AS at, mt.market_cap AS mc
-          FROM market_ticks mt
-          WHERE mt.token_address=f.token_address AND mt.tick_at>=f.shadow_entry_at AND mt.market_cap IS NOT NULL AND mt.market_cap>0
-          UNION ALL
-          SELECT s.snapshot_at AS at, s.market_cap AS mc
-          FROM snapshots s
-          WHERE s.token_address=f.token_address AND s.snapshot_at>=f.shadow_entry_at AND s.market_cap IS NOT NULL AND s.market_cap>0
-        ) x ORDER BY x.at DESC LIMIT 1
+        SELECT x.at FROM qualified_obs x
+        WHERE x.token_address=f.token_address AND x.at>=f.shadow_entry_at
+        ORDER BY x.at DESC LIMIT 1
       ) AS fast_last_obs_at,
       (
-        SELECT x.mc FROM (
-          SELECT mt.tick_at AS at, mt.market_cap AS mc
-          FROM market_ticks mt
-          WHERE mt.token_address=f.token_address AND mt.tick_at>=f.shadow_entry_at AND mt.market_cap IS NOT NULL AND mt.market_cap>0
-          UNION ALL
-          SELECT s.snapshot_at AS at, s.market_cap AS mc
-          FROM snapshots s
-          WHERE s.token_address=f.token_address AND s.snapshot_at>=f.shadow_entry_at AND s.market_cap IS NOT NULL AND s.market_cap>0
-        ) x ORDER BY x.at DESC LIMIT 1
+        SELECT x.mc FROM qualified_obs x
+        WHERE x.token_address=f.token_address AND x.at>=f.shadow_entry_at
+        ORDER BY x.at DESC LIMIT 1
       ) AS fast_last_mc,
-      MAX(
-        COALESCE((SELECT MAX(mt.market_cap) FROM market_ticks mt WHERE mt.token_address=f.token_address AND mt.tick_at>=f.shadow_entry_at AND mt.market_cap>0), 0),
-        COALESCE((SELECT MAX(s.market_cap) FROM snapshots s WHERE s.token_address=f.token_address AND s.snapshot_at>=f.shadow_entry_at AND s.market_cap>0), 0),
-        COALESCE(f.shadow_entry_market_cap, 0)
-      ) AS fast_peak_mc,
+      COALESCE((
+        SELECT MAX(x.mc) FROM qualified_obs x
+        WHERE x.token_address=f.token_address AND x.at>=f.shadow_entry_at
+      ), f.shadow_entry_market_cap) AS fast_peak_mc,
       CASE WHEN t.canary_at IS NULL THEN NULL ELSE (
-        SELECT x.at FROM (
-          SELECT mt.tick_at AS at, mt.market_cap AS mc
-          FROM market_ticks mt
-          WHERE mt.token_address=f.token_address AND mt.tick_at>=t.canary_at AND mt.market_cap IS NOT NULL AND mt.market_cap>0
-          UNION ALL
-          SELECT s.snapshot_at AS at, s.market_cap AS mc
-          FROM snapshots s
-          WHERE s.token_address=f.token_address AND s.snapshot_at>=t.canary_at AND s.market_cap IS NOT NULL AND s.market_cap>0
-        ) x ORDER BY x.at DESC LIMIT 1
+        SELECT x.at FROM qualified_obs x
+        WHERE x.token_address=f.token_address AND x.at>=t.canary_at
+        ORDER BY x.at DESC LIMIT 1
       ) END AS canary_last_obs_at,
       CASE WHEN t.canary_at IS NULL THEN NULL ELSE (
-        SELECT x.mc FROM (
-          SELECT mt.tick_at AS at, mt.market_cap AS mc
-          FROM market_ticks mt
-          WHERE mt.token_address=f.token_address AND mt.tick_at>=t.canary_at AND mt.market_cap IS NOT NULL AND mt.market_cap>0
-          UNION ALL
-          SELECT s.snapshot_at AS at, s.market_cap AS mc
-          FROM snapshots s
-          WHERE s.token_address=f.token_address AND s.snapshot_at>=t.canary_at AND s.market_cap IS NOT NULL AND s.market_cap>0
-        ) x ORDER BY x.at DESC LIMIT 1
+        SELECT x.mc FROM qualified_obs x
+        WHERE x.token_address=f.token_address AND x.at>=t.canary_at
+        ORDER BY x.at DESC LIMIT 1
       ) END AS canary_last_mc,
-      CASE WHEN t.canary_at IS NULL THEN NULL ELSE MAX(
-        COALESCE((SELECT MAX(mt.market_cap) FROM market_ticks mt WHERE mt.token_address=f.token_address AND mt.tick_at>=t.canary_at AND mt.market_cap>0), 0),
-        COALESCE((SELECT MAX(s.market_cap) FROM snapshots s WHERE s.token_address=f.token_address AND s.snapshot_at>=t.canary_at AND s.market_cap>0), 0),
-        COALESCE(t.canary_market_cap, 0)
-      ) END AS canary_peak_mc
+      CASE WHEN t.canary_at IS NULL THEN NULL ELSE COALESCE((
+        SELECT MAX(x.mc) FROM qualified_obs x
+        WHERE x.token_address=f.token_address AND x.at>=t.canary_at
+      ), t.canary_market_cap) END AS canary_peak_mc
     FROM fast_m30_shadow f
     JOIN tokens t ON t.token_address=f.token_address
     WHERE f.qualifies_canary1=1

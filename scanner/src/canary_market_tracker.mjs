@@ -401,6 +401,9 @@ async function trackRows(rows, label) {
       source: metrics.source,
       discoveryMultiple: result.discoveryMultiple,
       canaryMultiple: result.canaryMultiple,
+      qualified: result.qualified,
+      qualifiedDiscoveryMultiple: result.qualifiedDiscoveryMultiple,
+      qualifiedCanaryMultiple: result.qualifiedCanaryMultiple,
       newAth: result.newAthPrice,
     }));
   }

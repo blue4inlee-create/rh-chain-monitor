@@ -130,7 +130,7 @@ export function refreshShadowStages({ limit = 1000 } = {}) {
       t.token_address,
       t.first_seen_at,
       t.monitor_stage AS production_stage,
-      t.max_multiple_discovery AS discovery_max,
+      t.qualified_max_multiple_discovery AS discovery_max,
       CASE
         WHEN t.discovery_price_usd > 0 AND t.current_price_usd IS NOT NULL
         THEN t.current_price_usd / t.discovery_price_usd
