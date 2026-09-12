@@ -13,6 +13,10 @@ const CFG = {
   diskWarn: Number(process.env.HEALTH_DISK_WARN_PCT || 80),
   diskCritical: Number(process.env.HEALTH_DISK_CRITICAL_PCT || 92),
   opportunityStaleMs: Math.max(60_000, Number(process.env.HEALTH_OPPORTUNITY_STALE_MS || 180_000)),
+  httpTimeoutMs: Math.max(3_000, Number(process.env.HEALTH_HTTP_TIMEOUT_MS || 6_500)),
+  opportunityHttpTimeoutMs: Math.max(6_000, Number(process.env.HEALTH_OPPORTUNITY_HTTP_TIMEOUT_MS || 12_000)),
+  httpsFailConfirmations: Math.max(2, Number(process.env.HEALTH_HTTPS_FAIL_CONFIRMATIONS || 2)),
+  httpsRecoveryConfirmations: Math.max(2, Number(process.env.HEALTH_HTTPS_RECOVERY_CONFIRMATIONS || 2)),
   dbPath: String(process.env.SQLITE_PATH || '/data/rh_monitor.db'),
   statePath: String(process.env.HEALTH_STATE_PATH || '/data/rh_health_monitor_state.json'),
   statusPath: String(process.env.HEALTH_STATUS_PATH || '/data/rh_health_status.json'),
@@ -29,9 +33,11 @@ const PUBLIC_ROUTES = {
   calibration: '/sheet-calibration-8e3a1f6b7c2d.csv',
   thresholds: '/sheet-thresholds-5a3d9c7e1b4f.csv',
   shadow: '/sheet-shadow-2c7e9a4d1f6b.csv',
+  secondLeg: '/sheet-second-leg-6b2e4d8c1a9f.csv',
 };
 const PROCESSES = {
   alertWorker: 'alert_worker.mjs',
+  secondLegWorker: 'second_leg_alert_worker.mjs',
   historyWorker: 'history_worker.mjs',
   opportunityWorker: 'opportunity_worker.mjs',
   shadowWorker: 'shadow_threshold_worker.mjs',
@@ -46,7 +52,7 @@ function ageMs(v) { const t = new Date(v || '').getTime(); return Number.isFinit
 
 async function loadState() {
   try { return JSON.parse(await readFile(CFG.statePath, 'utf8')); }
-  catch { return { active: [], failures: {}, lastNotifyAt: null, lastRestartAt: null }; }
+  catch { return { active: [], failures: {}, httpsRoutes: {}, lastNotifyAt: null, lastRestartAt: null }; }
 }
 async function writeJson(path, value) {
   const tmp = `${path}.tmp`;
@@ -67,9 +73,9 @@ async function processCheck(pattern) {
   const r = await cmd('pgrep', ['-af', pattern]);
   return { ok: r.ok && Boolean(r.output), detail: r.ok ? 'running' : 'missing' };
 }
-async function httpCheck(url, json = false) {
+async function httpCheck(url, json = false, timeoutMs = CFG.httpTimeoutMs) {
   try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(6500), headers: { 'user-agent': 'rh-health-monitor/1.1' } });
+    const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { 'user-agent': 'rh-health-monitor/1.2' } });
     let body = null;
     if (json) { try { body = await r.json(); } catch {} }
     else { try { await r.body?.cancel(); } catch {} }
@@ -100,8 +106,8 @@ function databaseCheck() {
 async function rpcCheck() {
   try {
     const r = await fetch(CFG.rpcUrl, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'user-agent': 'rh-health-monitor/1.1' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }), signal: AbortSignal.timeout(6500),
+      method: 'POST', headers: { 'content-type': 'application/json', 'user-agent': 'rh-health-monitor/1.2' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }), signal: AbortSignal.timeout(CFG.httpTimeoutMs),
     });
     const raw = await r.text();
     let j = null; try { j = JSON.parse(raw); } catch {}
@@ -115,17 +121,50 @@ async function collect() {
     httpCheck('http://127.0.0.1:8080/health', true), httpCheck('http://127.0.0.1:3105/health', true),
     diskCheck(), rpcCheck(),
   ]);
-  const processes = {};
-  for (const [k, p] of Object.entries(PROCESSES)) processes[k] = await processCheck(p);
-  const publicRoutes = {};
-  for (const [k, p] of Object.entries(PUBLIC_ROUTES)) publicRoutes[k] = await httpCheck(`${CFG.publicBase}${p}`);
+  const processEntries = await Promise.all(Object.entries(PROCESSES).map(async ([k, p]) => [k, await processCheck(p)]));
+  const processes = Object.fromEntries(processEntries);
+  const routeEntries = await Promise.all(Object.entries(PUBLIC_ROUTES).map(async ([k, p]) => {
+    const timeoutMs = k === 'opportunity' ? CFG.opportunityHttpTimeoutMs : CFG.httpTimeoutMs;
+    return [k, await httpCheck(`${CFG.publicBase}${p}`, false, timeoutMs)];
+  }));
+  const publicRoutes = Object.fromEntries(routeEntries);
   return {
     checkedAt: nowIso(), main, caddy, scanner, history, disk, rpc,
     db: databaseCheck(), processes, publicRoutes,
     channels: { bark: Boolean(CFG.barkKey), telegram: Boolean(CFG.telegramToken && CFG.telegramChatId) },
   };
 }
-function incidents(checks) {
+
+export function advanceHttpsRouteState(previous = {}, publicRoutes = {}, failConfirmations = CFG.httpsFailConfirmations, recoveryConfirmations = CFG.httpsRecoveryConfirmations) {
+  const out = {};
+  for (const [key, result] of Object.entries(publicRoutes || {})) {
+    const prior = previous?.[key] || {};
+    const priorIncident = Boolean(prior.incident);
+    let failures = 0;
+    let successes = 0;
+    let incident = priorIncident;
+    if (result?.ok) {
+      failures = 0;
+      successes = Number(prior.successes || 0) + 1;
+      if (priorIncident && successes >= recoveryConfirmations) incident = false;
+    } else {
+      failures = Number(prior.failures || 0) + 1;
+      successes = 0;
+      if (!priorIncident && failures >= failConfirmations) incident = true;
+    }
+    out[key] = {
+      failures,
+      successes,
+      incident,
+      lastOk: Boolean(result?.ok),
+      status: Number(result?.status || 0),
+      error: text(result?.error || '').slice(0, 120),
+    };
+  }
+  return out;
+}
+
+function incidents(checks, httpsRoutes = {}) {
   const x = [];
   const add = (key, severity, message, restartable = false) => x.push({ key, severity, message, restartable });
   if (!checks.main.ok) add('main-service', 'CRITICAL', `主服务异常：${checks.main.detail}`, true);
@@ -135,8 +174,8 @@ function incidents(checks) {
   if (!checks.db.ok) add('sqlite', 'CRITICAL', `SQLite quick_check=${checks.db.quick}${checks.db.error ? ` ${checks.db.error}` : ''}`);
   if (checks.db.opportunityAt && ageMs(checks.db.opportunityAt) > CFG.opportunityStaleMs) add('opportunity-stale', 'CRITICAL', `Opportunity Pool 已 ${Math.round(ageMs(checks.db.opportunityAt)/1000)} 秒未刷新`, true);
   if (!checks.caddy.ok) add('caddy', 'CRITICAL', `Caddy 异常：${checks.caddy.detail}`);
-  const badRoutes = Object.entries(checks.publicRoutes).filter(([,v]) => !v.ok).map(([k]) => k);
-  if (badRoutes.length) add('https-exports', 'WARN', `HTTPS 出口异常：${badRoutes.join(', ')}`);
+  const badRoutes = Object.entries(httpsRoutes).filter(([, v]) => v.incident).map(([k]) => k);
+  if (badRoutes.length) add('https-exports', 'WARN', `HTTPS 出口连续异常：${badRoutes.join(', ')}`);
   if (!checks.rpc.ok) add('rpc', 'WARN', checks.rpc.rateLimited ? 'Robinhood RPC 触发 429 限流' : `Robinhood RPC 异常 HTTP ${checks.rpc.status || 0}`);
   if (checks.disk.usedPct != null && checks.disk.usedPct >= CFG.diskCritical) add('disk', 'CRITICAL', `磁盘使用率 ${checks.disk.usedPct.toFixed(1)}%`);
   else if (checks.disk.warn) add('disk', 'WARN', `磁盘使用率 ${checks.disk.usedPct.toFixed(1)}%`);
@@ -197,10 +236,15 @@ function bodyFor(list, restart) {
 export async function runCycle({ forceNotify = false } = {}) {
   const state = await loadState();
   let checks = await collect();
-  let list = incidents(checks);
+  let httpsRoutes = advanceHttpsRouteState(state.httpsRoutes || {}, checks.publicRoutes);
+  let list = incidents(checks, httpsRoutes);
   const failures = nextFailures(state.failures, list);
   const restart = await maybeRestart(state, list, failures);
-  if (restart.attempted && restart.ok) { checks = await collect(); list = incidents(checks); }
+  if (restart.attempted && restart.ok) {
+    checks = await collect();
+    httpsRoutes = advanceHttpsRouteState(httpsRoutes, checks.publicRoutes);
+    list = incidents(checks, httpsRoutes);
+  }
 
   const prev = new Set(state.active || []), cur = new Set(list.map(i => i.key));
   const changed = prev.size !== cur.size || [...cur].some(k => !prev.has(k));
@@ -216,10 +260,43 @@ export async function runCycle({ forceNotify = false } = {}) {
     await notify('✅ RH Monitor 已恢复', `已恢复：${resolved.join(', ')}\n扫描、评分、提醒、历史追踪与 Shadow 继续运行。`);
     notified = true;
   }
-  const next = { active: [...cur], failures, lastNotifyAt: notified ? nowIso() : state.lastNotifyAt || null, lastRestartAt: restart.attempted ? restart.at : state.lastRestartAt || null, updatedAt: nowIso() };
-  const status = { ok: list.length === 0, incidents: list, restart, checks, monitor: { grace, pollMs: CFG.pollMs }, updatedAt: nowIso() };
-  await writeJson(CFG.statePath, next); await writeJson(CFG.statusPath, status);
-  console.log('[health monitor]', JSON.stringify({ ok: status.ok, incidents: list.map(i => i.key), restart: restart.attempted ? restart.ok : null, diskPct: checks.disk.usedPct, opportunityAgeSec: checks.db.opportunityAgeSec }));
+  const next = {
+    active: [...cur],
+    failures,
+    httpsRoutes,
+    lastNotifyAt: notified ? nowIso() : state.lastNotifyAt || null,
+    lastRestartAt: restart.attempted ? restart.at : state.lastRestartAt || null,
+    updatedAt: nowIso(),
+  };
+  const status = {
+    ok: list.length === 0,
+    incidents: list,
+    restart,
+    checks,
+    httpsRoutes,
+    monitor: {
+      grace,
+      pollMs: CFG.pollMs,
+      httpTimeoutMs: CFG.httpTimeoutMs,
+      opportunityHttpTimeoutMs: CFG.opportunityHttpTimeoutMs,
+      httpsFailConfirmations: CFG.httpsFailConfirmations,
+      httpsRecoveryConfirmations: CFG.httpsRecoveryConfirmations,
+    },
+    updatedAt: nowIso(),
+  };
+  await writeJson(CFG.statePath, next);
+  await writeJson(CFG.statusPath, status);
+  const httpsPending = Object.entries(httpsRoutes)
+    .filter(([, v]) => v.incident || v.failures > 0)
+    .map(([k, v]) => `${k}:${v.incident ? 'incident' : `fail${v.failures}`}`);
+  console.log('[health monitor]', JSON.stringify({
+    ok: status.ok,
+    incidents: list.map(i => i.key),
+    restart: restart.attempted ? restart.ok : null,
+    diskPct: checks.disk.usedPct,
+    opportunityAgeSec: checks.db.opportunityAgeSec,
+    httpsPending,
+  }));
   return status;
 }
 
@@ -229,8 +306,21 @@ async function main() {
     console.log(JSON.stringify(await notify('✅ RH Monitor 健康监控已启用', '独立健康监控已上线。异常会通过 Bark + Telegram 推送；连续主服务故障会尝试自动重启。')));
     return;
   }
-  if (args.has('--once')) { const r = await runCycle({ forceNotify: args.has('--force-notify') }); console.log(JSON.stringify({ ok: r.ok, incidents: r.incidents }, null, 2)); return; }
-  console.log('[health monitor boot]', JSON.stringify({ pollMs: CFG.pollMs, restartAfter: CFG.restartAfter, diskWarn: CFG.diskWarn, diskCritical: CFG.diskCritical }));
+  if (args.has('--once')) {
+    const r = await runCycle({ forceNotify: args.has('--force-notify') });
+    console.log(JSON.stringify({ ok: r.ok, incidents: r.incidents }, null, 2));
+    return;
+  }
+  console.log('[health monitor boot]', JSON.stringify({
+    pollMs: CFG.pollMs,
+    restartAfter: CFG.restartAfter,
+    diskWarn: CFG.diskWarn,
+    diskCritical: CFG.diskCritical,
+    httpTimeoutMs: CFG.httpTimeoutMs,
+    opportunityHttpTimeoutMs: CFG.opportunityHttpTimeoutMs,
+    httpsFailConfirmations: CFG.httpsFailConfirmations,
+    httpsRecoveryConfirmations: CFG.httpsRecoveryConfirmations,
+  }));
   while (!stopping) {
     const t = Date.now();
     try { await runCycle(); } catch (e) { console.error('[health monitor cycle]', e?.stack || e); }
