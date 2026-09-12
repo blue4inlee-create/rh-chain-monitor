@@ -85,6 +85,26 @@ function isRateLimit(err) {
   const s = text(err?.message || err);
   return /429|rate.?limit|too many requests|-32005/i.test(s);
 }
+function isSqliteBusy(err) {
+  return err?.code === 'SQLITE_BUSY' || /database is locked/i.test(text(err?.message || err));
+}
+
+async function retrySqliteBusy(fn, { attempts = 5, initialDelayMs = 250, label = 'db' } = {}) {
+  let delayMs = initialDelayMs;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isSqliteBusy(err) || attempt === attempts) throw err;
+      console.warn('[job worker db busy]', JSON.stringify({ label, attempt, waitMs: delayMs }));
+      await sleep(delayMs);
+      delayMs = Math.min(5000, delayMs * 2);
+    }
+  }
+  throw lastErr;
+}
 
 function scheduleRpc(fn) {
   const run = async () => {
@@ -126,7 +146,7 @@ async function fetchJson(url, timeoutMs = 7000, headers = {}) {
     const res = await fetch(url, {
       headers: {
         accept: 'application/json',
-        'user-agent': 'rh-chain-monitor-job-worker/2.9.1',
+        'user-agent': 'rh-chain-monitor-job-worker/2.9.2',
         ...headers,
       },
       signal: AbortSignal.timeout(timeoutMs),
@@ -383,15 +403,27 @@ async function enrichJob(job) {
 async function main() {
   const db = initializeDatabase();
   console.log('[job worker boot]', JSON.stringify({
-    version: '2.9.1',
+    version: '2.9.2',
     pollMs: CFG.pollMs,
     rpcGapMs: CFG.rpcGapMs,
     blockscoutKeyConfigured: Boolean(CFG.blockscoutKey),
     ...db,
   }));
 
+  let claimBusyBackoffMs = 250;
   while (true) {
-    const job = claimDueJob();
+    let job;
+    try {
+      job = claimDueJob();
+      claimBusyBackoffMs = 250;
+    } catch (err) {
+      if (!isSqliteBusy(err)) throw err;
+      console.warn('[job worker db busy]', JSON.stringify({ label: 'claimDueJob', waitMs: claimBusyBackoffMs }));
+      await sleep(claimBusyBackoffMs);
+      claimBusyBackoffMs = Math.min(5000, claimBusyBackoffMs * 2);
+      continue;
+    }
+
     if (!job) {
       await sleep(CFG.pollMs);
       continue;
@@ -402,7 +434,28 @@ async function main() {
       console.log('[job done]', JSON.stringify(result));
       if (result.stage?.changed) console.log('[stage change]', JSON.stringify({ token: result.token, ...result.stage }));
     } catch (err) {
-      const failed = failJob(job.job_id, err?.message || err);
+      let failed;
+      try {
+        failed = await retrySqliteBusy(
+          () => failJob(job.job_id, err?.message || err),
+          { label: 'failJob' },
+        );
+      } catch (markErr) {
+        console.error('[job fail state error]', JSON.stringify({
+          jobId: job.job_id,
+          type: job.job_type,
+          token: job.token_address,
+          originalError: text(err?.message || err),
+          error: text(markErr?.message || markErr),
+          code: markErr?.code || '',
+        }));
+        if (isSqliteBusy(markErr)) {
+          await sleep(1000);
+          continue;
+        }
+        throw markErr;
+      }
+
       console.error('[job error]', JSON.stringify({
         jobId: job.job_id,
         type: job.job_type,
