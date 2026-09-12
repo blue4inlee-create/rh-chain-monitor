@@ -3,7 +3,6 @@ set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/rh-chain-monitor}"
 UNIT_FILE="/etc/systemd/system/rh-chain-health.service"
-ALERT_ENV="/etc/rh-chain-monitor-alert.env"
 NODE_BIN="$(command -v node)"
 MONITOR="$APP_DIR/scanner/src/production_health_monitor.mjs"
 
@@ -17,10 +16,6 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   echo "ERROR: tracked local changes detected; refusing to overwrite them."
   git status --short
   exit 2
-fi
-if [[ ! -f "$ALERT_ENV" ]]; then
-  echo "ERROR: $ALERT_ENV missing; Bark/Telegram alert channels must be configured first"
-  exit 3
 fi
 
 git pull --ff-only origin main
@@ -49,7 +44,7 @@ Environment=HEALTH_HTTP_TIMEOUT_MS=6500
 Environment=HEALTH_OPPORTUNITY_HTTP_TIMEOUT_MS=12000
 Environment=HEALTH_HTTPS_FAIL_CONFIRMATIONS=2
 Environment=HEALTH_HTTPS_RECOVERY_CONFIRMATIONS=2
-EnvironmentFile=$ALERT_ENV
+Environment=HEALTH_PUSH_ALERTS=false
 ExecStart=$NODE_BIN $MONITOR
 Restart=always
 RestartSec=5
@@ -66,15 +61,10 @@ sleep 5
 systemctl is-active --quiet rh-chain-health.service
 
 echo "health service active"
+echo "health push notifications disabled; Bark/Telegram are reserved for trade signals"
 journalctl -u rh-chain-health.service -n 80 --no-pager \
   | grep -E '\[health monitor boot\]|\[health monitor\]|\[health auto-restart\]|\[health notify\]' \
   | tail -20 || true
-
-set -a
-# shellcheck disable=SC1090
-source "$ALERT_ENV"
-set +a
-"$NODE_BIN" "$MONITOR" --test-notify || true
 
 if [[ -f /data/rh_health_status.json ]]; then
   python3 - <<'PY'
@@ -85,8 +75,9 @@ print('health status ok=',j.get('ok'))
 print('incidents=',[x.get('key') for x in j.get('incidents',[])])
 print('diskPct=',round((j.get('checks',{}).get('disk',{}).get('usedPct') or 0),1))
 print('opportunityAgeSec=',j.get('checks',{}).get('db',{}).get('opportunityAgeSec'))
+print('pushAlerts=',j.get('monitor',{}).get('pushAlerts'))
 print('httpsRoutes=',{k:{'incident':v.get('incident'),'failures':v.get('failures'),'successes':v.get('successes')} for k,v in j.get('httpsRoutes',{}).items()})
 PY
 fi
 
-echo "DONE: production health monitor V1 deployed"
+echo "DONE: production health monitor V1 deployed in silent mode"
