@@ -17,6 +17,7 @@ const CFG = {
   opportunityHttpTimeoutMs: Math.max(6_000, Number(process.env.HEALTH_OPPORTUNITY_HTTP_TIMEOUT_MS || 12_000)),
   httpsFailConfirmations: Math.max(2, Number(process.env.HEALTH_HTTPS_FAIL_CONFIRMATIONS || 2)),
   httpsRecoveryConfirmations: Math.max(2, Number(process.env.HEALTH_HTTPS_RECOVERY_CONFIRMATIONS || 2)),
+  pushAlerts: ['1', 'true', 'yes', 'on'].includes(String(process.env.HEALTH_PUSH_ALERTS || 'false').trim().toLowerCase()),
   dbPath: String(process.env.SQLITE_PATH || '/data/rh_monitor.db'),
   statePath: String(process.env.HEALTH_STATE_PATH || '/data/rh_health_monitor_state.json'),
   statusPath: String(process.env.HEALTH_STATUS_PATH || '/data/rh_health_status.json'),
@@ -75,7 +76,7 @@ async function processCheck(pattern) {
 }
 async function httpCheck(url, json = false, timeoutMs = CFG.httpTimeoutMs) {
   try {
-    const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { 'user-agent': 'rh-health-monitor/1.2' } });
+    const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { 'user-agent': 'rh-health-monitor/1.3' } });
     let body = null;
     if (json) { try { body = await r.json(); } catch {} }
     else { try { await r.body?.cancel(); } catch {} }
@@ -106,7 +107,7 @@ function databaseCheck() {
 async function rpcCheck() {
   try {
     const r = await fetch(CFG.rpcUrl, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'user-agent': 'rh-health-monitor/1.2' },
+      method: 'POST', headers: { 'content-type': 'application/json', 'user-agent': 'rh-health-monitor/1.3' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }), signal: AbortSignal.timeout(CFG.httpTimeoutMs),
     });
     const raw = await r.text();
@@ -179,7 +180,7 @@ function incidents(checks, httpsRoutes = {}) {
   if (!checks.rpc.ok) add('rpc', 'WARN', checks.rpc.rateLimited ? 'Robinhood RPC 触发 429 限流' : `Robinhood RPC 异常 HTTP ${checks.rpc.status || 0}`);
   if (checks.disk.usedPct != null && checks.disk.usedPct >= CFG.diskCritical) add('disk', 'CRITICAL', `磁盘使用率 ${checks.disk.usedPct.toFixed(1)}%`);
   else if (checks.disk.warn) add('disk', 'WARN', `磁盘使用率 ${checks.disk.usedPct.toFixed(1)}%`);
-  if (!checks.channels.bark || !checks.channels.telegram) add('channels', 'CRITICAL', 'Bark / Telegram 至少一个未配置');
+  if (CFG.pushAlerts && (!checks.channels.bark || !checks.channels.telegram)) add('channels', 'CRITICAL', 'Bark / Telegram 至少一个未配置');
   if ((checks.db.failedAlerts || 0) > 0) add('alert-failures', 'WARN', `提醒历史中存在 ${checks.db.failedAlerts} 条通道失败记录`);
   return x;
 }
@@ -253,10 +254,10 @@ export async function runCycle({ forceNotify = false } = {}) {
   const reminder = list.length && (!Number.isFinite(lastNotify) || Date.now() - lastNotify >= CFG.reminderMs);
   const grace = Date.now() - bootMs < CFG.startupGraceMs;
   let notified = false;
-  if (!grace && list.length && (changed || reminder || forceNotify)) {
+  if (CFG.pushAlerts && !grace && list.length && (changed || reminder || forceNotify)) {
     await notify(`${list.some(i => i.severity === 'CRITICAL') ? '⚠️' : '🟡'} RH Monitor 系统异常`, bodyFor(list, restart));
     notified = true;
-  } else if (!grace && !list.length && resolved.length) {
+  } else if (CFG.pushAlerts && !grace && !list.length && resolved.length) {
     await notify('✅ RH Monitor 已恢复', `已恢复：${resolved.join(', ')}\n扫描、评分、提醒、历史追踪与 Shadow 继续运行。`);
     notified = true;
   }
@@ -276,6 +277,7 @@ export async function runCycle({ forceNotify = false } = {}) {
     httpsRoutes,
     monitor: {
       grace,
+      pushAlerts: CFG.pushAlerts,
       pollMs: CFG.pollMs,
       httpTimeoutMs: CFG.httpTimeoutMs,
       opportunityHttpTimeoutMs: CFG.opportunityHttpTimeoutMs,
@@ -295,6 +297,7 @@ export async function runCycle({ forceNotify = false } = {}) {
     restart: restart.attempted ? restart.ok : null,
     diskPct: checks.disk.usedPct,
     opportunityAgeSec: checks.db.opportunityAgeSec,
+    pushAlerts: CFG.pushAlerts,
     httpsPending,
   }));
   return status;
@@ -303,6 +306,10 @@ export async function runCycle({ forceNotify = false } = {}) {
 async function main() {
   const args = new Set(process.argv.slice(2));
   if (args.has('--test-notify')) {
+    if (!CFG.pushAlerts) {
+      console.log(JSON.stringify({ ok: true, skipped: true, reason: 'HEALTH_PUSH_ALERTS=false' }));
+      return;
+    }
     console.log(JSON.stringify(await notify('✅ RH Monitor 健康监控已启用', '独立健康监控已上线。异常会通过 Bark + Telegram 推送；连续主服务故障会尝试自动重启。')));
     return;
   }
@@ -316,6 +323,7 @@ async function main() {
     restartAfter: CFG.restartAfter,
     diskWarn: CFG.diskWarn,
     diskCritical: CFG.diskCritical,
+    pushAlerts: CFG.pushAlerts,
     httpTimeoutMs: CFG.httpTimeoutMs,
     opportunityHttpTimeoutMs: CFG.opportunityHttpTimeoutMs,
     httpsFailConfirmations: CFG.httpsFailConfirmations,
