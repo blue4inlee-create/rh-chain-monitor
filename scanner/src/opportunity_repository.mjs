@@ -1,11 +1,27 @@
 import { getDatabase } from './db.mjs';
 
+const WRITE_CHUNK = Math.max(10, Math.min(250, Number(process.env.OPPORTUNITY_WRITE_CHUNK || 50)));
+const WRITE_YIELD_MS = Math.max(0, Math.min(100, Number(process.env.OPPORTUNITY_WRITE_YIELD_MS || 8)));
+const BUSY_RETRIES = Math.max(0, Math.min(10, Number(process.env.OPPORTUNITY_BUSY_RETRIES || 6)));
+let schemaReady = false;
+
+function isBusy(err) {
+  return /SQLITE_BUSY|database is locked/i.test(String(err?.code || '') + ' ' + String(err?.message || err || ''));
+}
+
+function blockingSleep(ms) {
+  if (!(ms > 0)) return;
+  const sab = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
+
 function addColumnIfMissing(db, table, column, definition) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(x => x.name);
   if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
 export function ensureOpportunitySchema() {
+  if (schemaReady) return;
   const db = getDatabase();
   db.exec(`CREATE TABLE IF NOT EXISTS opportunity_pool (
     token_address TEXT PRIMARY KEY,
@@ -34,6 +50,7 @@ export function ensureOpportunitySchema() {
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_opportunity_score ON opportunity_pool(score DESC, updated_at DESC);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_opportunity_gate ON opportunity_pool(buy_blocked, risk_gate, score DESC);`);
+  schemaReady = true;
 }
 
 export function saveOpportunityRows(rows = []) {
@@ -61,7 +78,7 @@ export function saveOpportunityRows(rows = []) {
   critical_unknown_count=excluded.critical_unknown_count,
   risk_reasons=excluded.risk_reasons`);
   const now = new Date().toISOString();
-  const tx = db.transaction(items => {
+  const writeChunk = db.transaction(items => {
     for (const r of items) {
       stmt.run(
         String(r.address || '').toLowerCase(), r.symbol || '', r.stage || '', Number(r.score || 0),
@@ -73,7 +90,22 @@ export function saveOpportunityRows(rows = []) {
       );
     }
   });
-  tx(rows);
+
+  for (let i = 0; i < rows.length; i += WRITE_CHUNK) {
+    const chunk = rows.slice(i, i + WRITE_CHUNK);
+    let attempt = 0;
+    while (true) {
+      try {
+        writeChunk(chunk);
+        break;
+      } catch (err) {
+        if (!isBusy(err) || attempt >= BUSY_RETRIES) throw err;
+        blockingSleep(Math.min(1000, 25 * (2 ** attempt)));
+        attempt += 1;
+      }
+    }
+    if (i + WRITE_CHUNK < rows.length) blockingSleep(WRITE_YIELD_MS);
+  }
 }
 
 export function getOpportunityRows(limit = 100) {
